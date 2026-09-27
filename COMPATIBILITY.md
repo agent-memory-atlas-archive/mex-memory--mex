@@ -52,21 +52,53 @@ shipping new versions.
 If you only use the `mex` CLI, most of this still applies, but CLI flags
 themselves are best-effort (see [CLI surface](#cli-surface) below).
 
-## Upgrading to 0.8.2
+## Upgrading to 0.8.3
 
-Install `mex-agent@0.8.2`, then run `mex skills sync --dry-run` and
-`mex skills sync` in each project whose managed agent skills and instructions
-you want to update. Review conflicts with locally edited instructions and start
-a new agent session afterward. An already completed 0.8.0 or 0.8.1 setup does not need
-to run setup again just for this package upgrade. Installing the package alone
-does not change the repository.
+Install `mex-agent@0.8.3`. In a project with an existing code graph, keep that
+index and run:
 
-In 0.8.2, `mex setup` opens the browser setup wizard and bare `mex` opens
-Hub (or setup when incomplete). Terminal users and scripts should use
-`mex setup --cli`; `mex tui` keeps the terminal dashboard. `setup --dry-run`
-remains a read-only terminal preview. `--no-open` and `--port` apply to browser
-launches. Optional global installation pins the running version. No public
-package exports or Graph/Wiki/Relay storage formats change in this release.
+```bash
+mex graph refresh
+mex sync
+```
+
+The first refresh performs a full extraction using `typescript-5.9-v5`.
+TypeScript signatures now use stable module paths and canonical type ordering,
+so some node IDs change. Refresh uses the old graph to retain identity aliases;
+sync can then rewrite affected `grounds_to` entries and inline `mex://` anchors.
+Review the changes and any ambiguous or missing groundings before committing the
+scaffold through Git. Do not delete or rebuild a working old graph as the first
+upgrade step. If status reports an incompatible or damaged store, follow its
+explicit recovery action; a fresh clone or rebuild without the old graph must
+reconcile from committed fingerprints and may need manual re-grounding.
+
+Refresh the Wiki index with `mex wiki rebuild-index` if the scaffold changed.
+Graph schema remains v4; refresh adds an internal per-file extraction cache.
+Canonical Wiki and Relay artifact versions remain unchanged. Ordinary reads
+never migrate, rebuild, or accept a new grounding baseline.
+
+For project integrations managed by MEX, run `mex skills sync --dry-run`, review
+any conflicts, then run `mex skills sync` and start a new agent session.
+Standalone skills installed through `npx skills add mex-memory/mex` are an
+alternative installer; do not overlay them on a MEX-managed integration.
+Completed 0.8.0–0.8.2 setups do not need setup again solely for this upgrade.
+
+The 0.8.2 browser behavior continues: `mex setup` opens the setup wizard and bare
+`mex` opens Hub (or setup when incomplete). Use `mex setup --cli` for terminal
+prompts and `mex tui` for the terminal dashboard. `setup --dry-run` remains a
+read-only preview; `--no-open` and `--port` apply to browser launches.
+
+### Additive API changes in 0.8.3
+
+No package-root export is removed. `HeartbeatResult` adds the optional
+`filesWithoutLastUpdated` field, and `IssueCode` adds `GROUNDING_UNVERIFIED`,
+`GROUNDING_MIXED_SHAPE`, and `GROUNDING_MOVED_BY_NEIGHBORS`. Consumers that handle
+issue codes exhaustively should handle these cases. Existing entry points and
+required arguments remain unchanged.
+
+In 0.8.3, these additive changes ship within the 0.8 release line as a scoped
+exception to the usual minor-version rule for optional public fields below.
+The general versioning policy is unchanged.
 
 New **open-to-team Relays use artifact schema v4**. Upgrade teammates to 0.8.1
 before exchanging these handoffs; 0.8.0 cannot read the new format. Existing

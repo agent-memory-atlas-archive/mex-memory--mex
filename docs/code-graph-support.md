@@ -1,6 +1,6 @@
 # Code graph support
 
-This page documents the fixture-backed code-graph support shipped in mex v0.7.0.
+This page documents the fixture-backed code-graph support included in mex 0.8.3.
 
 This page distinguishes three evidence levels:
 
@@ -80,10 +80,10 @@ resolved `references` relationship below.
 
 ## Express route resolution
 
-Express is the only framework resolver included in v0.7.0. It activates
-when `express` appears in `dependencies` or `devDependencies`, recognizes a
-literal route registered through `app` or `router`, emits a `route` node, and
-links an identifier handler when it can resolve that handler confidently.
+Express activates when `express` appears in `dependencies` or `devDependencies`.
+It recognizes a literal route registered through `app` or `router`, emits a
+`route` node, and links an identifier handler when it can resolve that handler
+confidently.
 
 ```ts
 import express from "express";
@@ -103,7 +103,23 @@ the “activates the Express resolver and links a route to its handler” case i
 This resolver does not promise general framework or dynamic-dispatch analysis.
 Computed route strings, inline callbacks, handler arrays, middleware chains,
 and registrations hidden behind arbitrary helper functions are outside the
-fixture-backed shape. NestJS and Next.js resolvers are not included.
+fixture-backed shape. Additional resolvers are listed below.
+
+## Additional framework routes in 0.8.3
+
+The [resolver registry](../src/graph/resolution/frameworks/index.ts) also includes:
+
+| Framework | Bounded route behavior | Focused tests |
+|---|---|---|
+| Next.js App Router | HTTP exports in `app/**/route.ts` or `.js`, including `src/app`, dynamic segments, and route groups. Pages Router, layouts, and pages are outside this resolver. | [Next.js tests](../src/graph/__tests__/resolver-nextjs.test.ts) |
+| FastAPI | Literal shortcut decorators and `api_route` method lists, with static same-file `APIRouter` prefixes. Comments, docstrings, and dynamic paths are skipped. | [FastAPI tests](../src/graph/__tests__/resolver-fastapi.test.ts) |
+| Flask | Literal route/shortcut decorators and method lists, with static same-file Blueprint prefixes. Computed paths are skipped. | [Flask tests](../src/graph/__tests__/resolver-flask.test.ts) |
+| NestJS | Literal controller prefixes and HTTP method decorators, disambiguated by owning controller and duplicate-route ordinal. Computed controller or method paths are skipped. | [NestJS tests](../src/graph/__tests__/resolver-nestjs.test.ts) |
+
+These resolvers bind same-file handlers only when unambiguous. They do not model
+runtime routing, dependency injection, or arbitrary dynamic dispatch.
+FastAPI and Flask detection uses imports in staged Python source; Node framework
+detection uses repository package evidence.
 
 ## Graceful degradation
 
@@ -230,19 +246,18 @@ either resolve the requested declaration exactly or abstain.
   guessing; see
   [`src/graph/resolution/resolver.ts`](../src/graph/resolution/resolver.ts).
 - **Dynamic dispatch is not general-purpose.** Tree-sitter extraction and the
-  narrow Express resolver cover statically recognizable shapes, not runtime
+  bounded framework resolvers cover statically recognizable shapes, not runtime
   reflection, dependency injection, monkey-patching, or computed calls.
 - **Generated code is path-filtered, not identified semantically.** Common
   output trees such as `node_modules`, `dist`, `build`, `.next`, `out`,
   `coverage`, and `.mex` are excluded by the corpus policy in
   [`corpus-policy.ts`](../src/graph/corpus-policy.ts). Generated files outside
   those paths may still be indexed; add a `graph.ignore` glob to exclude them.
-- **Framework behavior is opt-in and narrow.** Express route-to-handler binding
-  is the only framework fixture in v0.7.0. Other frameworks remain unsupported
-  until their language extractor and resolver work merges.
-- **Support claims are fixture-bounded.** This page describes behavior exercised
-  in v0.7.0. It does not promise complete semantic analysis for every construct
-  in a supported language or support for unmerged Go, NestJS, or Next.js work.
+- **Framework behavior is opt-in and narrow.** The registered resolvers cover
+  the statically recognizable routes described above, not arbitrary framework code.
+- **Support claims are fixture-bounded.** This page does not promise complete
+  semantic analysis for every construct in a supported language. Go and Ruby
+  extraction remain outside this release.
 
 For contributor interfaces, fixture requirements, and registration points, see
 [Extending the code graph](extractors.md).

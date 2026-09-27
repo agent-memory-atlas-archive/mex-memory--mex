@@ -26,7 +26,7 @@ O MEX mantém a arquitetura, as decisões, os requisitos e as passagens de conte
 
 </div>
 
-> A descrição principal desta tradução ainda corresponde à versão 0.8.0. Os comandos de instalação e as orientações de atualização foram ajustados para 0.8.2; as mudanças do produto estão documentadas no [README em inglês](README.md) e nas [notas de lançamento da versão 0.8.2](RELEASE_NOTES.md).
+> A descrição principal desta tradução ainda corresponde à versão 0.8.0. Os comandos de instalação e as orientações de atualização foram ajustados para 0.8.3; as mudanças do produto estão documentadas no [README em inglês](README.md) e nas [notas de lançamento da versão 0.8.3](RELEASE_NOTES.md).
 
 ---
 
@@ -102,14 +102,14 @@ O MEX requer **Node.js 22.5 ou mais recente** e um repositório Git. O fluxo nor
 Execute na raiz do repositório:
 
 ```bash
-npx mex-agent@0.8.2 setup
+npx mex-agent@0.8.3 setup
 ```
 
 O comando abre a configuração no navegador local. Escolha as ferramentas de IA, crie o scaffold e os índices e use uma CLI disponível do Claude Code ou Codex para preencher a memória. Se o agente estiver indisponível ou falhar, copie o prompt e continue após o preenchimento manual. As instruções existentes são preservadas; orientações de integração manual não bloqueiam a configuração.
 
 Revise o diff exato no Hub e escolha **Commit setup** para criar um commit local; o ponto de verificação manual do Git continua disponível. A tela final explica como iniciar uma nova sessão e verificar a memória. Ela oferece instalar globalmente a versão em execução e, opcionalmente, deixar um e-mail e um nome opcional. O formulário integrado envia esses dados ao Web3Forms; eles não entram no repositório nem na telemetria. O computador guarda apenas se você enviou ou pulou o convite. Escolha **Open Hub** para abrir o Hub completo e o tour inicial.
 
-Para usar o terminal ou SSH: `npx mex-agent@0.8.2 setup --cli`. `setup --dry-run` continua sendo uma prévia de terminal sem alterações; `--no-open` imprime o link e `--port <n>` escolhe a porta local. Após instalar, `mex` abre o Hub ou a configuração e `mex tui` abre o painel de terminal. Os agentes têm seus próprios requisitos de instalação, conta e rede.
+Para usar o terminal ou SSH: `npx mex-agent@0.8.3 setup --cli`. `setup --dry-run` continua sendo uma prévia de terminal sem alterações; `--no-open` imprime o link e `--port <n>` escolhe a porta local. Após instalar, `mex` abre o Hub ou a configuração e `mex tui` abre o painel de terminal. Os agentes têm seus próprios requisitos de instalação, conta e rede.
 
 ![Três etapas para preparar o projeto: executar a configuração, preencher a memória e revisar e fazer commit do ponto de verificação antes de abrir o Hub.](docs/diagrams/readme/setup.svg)
 
@@ -125,9 +125,9 @@ Faça push do commit de configuração revisado pelo fluxo Git normal da equipe 
 Clone o repositório da equipe ou faça pull da branch pelo Git. Se a configuração da versão 0.8 estiver concluída e incluída em um commit, construa os índices derivados no seu próprio checkout e abra o Hub:
 
 ```bash
-npx mex-agent@0.8.2 graph rebuild
-npx mex-agent@0.8.2 wiki rebuild-index
-npx mex-agent@0.8.2 hub
+npx mex-agent@0.8.3 graph rebuild
+npx mex-agent@0.8.3 wiki rebuild-index
+npx mex-agent@0.8.3 hub
 ```
 
 Reutilize a memória compartilhada do projeto; não a gere novamente só para entrar na equipe. Em Team/Members, confira a identidade efetiva e, se necessário, selecione seu registro de Member existente para defini-lo localmente. Se você ainda não tiver um registro, crie um explicitamente pelo fluxo com revisão e compartilhe seus arquivos canônicos. Members servem para atribuição, não para login ou controle de permissões.
@@ -140,7 +140,7 @@ Configurações antigas ou incompletas devem seguir primeiro a seção de [atual
 <summary><strong>Prefere uma instalação global?</strong></summary>
 
 ```bash
-npm install -g mex-agent@0.8.2
+npm install -g mex-agent@0.8.3
 mex setup
 ```
 
@@ -155,14 +155,14 @@ A instalação global opcional, no Hub e no terminal, fixa a versão de MEX em e
 <summary><strong>Vai usar o MEX com um agente operacional persistente?</strong></summary>
 
 ```bash
-npx mex-agent@0.8.2 setup --mode agent-memory
+npx mex-agent@0.8.3 setup --mode agent-memory
 ```
 
 Esse template separado aplica o modelo de roteamento e manutenção do MEX a ambientes de homelab, infraestrutura e agentes de longa duração. Ele adiciona um contrato `HEARTBEAT.md` e convenções de limpeza; o fluxo de Code Graph, Wiki e Hub de equipe descrito neste README corresponde ao modo padrão `code-repo`.
 
 </details>
 
-Os exemplos usam `mex` para facilitar a leitura. Instale-o globalmente como indicado acima ou substitua-o por `npx mex-agent@0.8.2`.
+Os exemplos usam `mex` para facilitar a leitura. Instale-o globalmente como indicado acima ou substitua-o por `npx mex-agent@0.8.3`.
 
 <a id="how-mex-works"></a>
 
@@ -350,12 +350,14 @@ Use `mex capabilities --json` para descobrir capacidades em formato legível por
 Para uma instalação global, atualize a CLI e as cópias das skills selecionadas do Claude Code/Codex:
 
 ```bash
-npm install -g mex-agent@0.8.2
+npm install -g mex-agent@0.8.3
 mex skills sync --dry-run
 mex skills sync
 ```
 
 Se a configuração com a versão 0.8.0 já foi concluída, esses comandos atualizam as skills e as instruções gerenciadas do agente; não é necessário executar setup novamente só para atualizar o pacote. Revise os conflitos apontados com instruções editadas localmente e depois inicie uma nova sessão do agente.
+
+**Ao atualizar para 0.8.3, preserve o Graph existente.** Execute `mex graph refresh` e depois `mex sync`: a primeira atualização faz uma extração completa e pode mudar os identificadores TypeScript. Revise os casos ambíguos ou ausentes e faça commit das alterações do scaffold pelo Git. Se o scaffold mudar, atualize o índice Wiki com `mex wiki rebuild-index`. Um clone novo ou uma reconstrução sem o Graph anterior depende das impressões digitais salvas e pode exigir vincular o código novamente de forma manual. Consulte o [guia de compatibilidade](COMPATIBILITY.md#upgrading-to-083).
 
 Atualizar apenas o pacote e as skills não deixa um repositório antigo ou incompleto pronto para o Hub. Para esses repositórios, avalie setup com uma simulação antes de aplicá-lo; setup preserva os arquivos existentes e suas alterações ainda precisam ser revisadas:
 
