@@ -18,7 +18,7 @@ edges:
     condition: when refreshing the release README, badges, community links, or architecture illustrations
   - target: patterns/hub-first-run-onboarding.md
     condition: when adding or changing the Hub first-run tour or its checkout-local completion state
-last_updated: 2026-09-13
+last_updated: 2026-09-28
 ---
 
 # Session Bootstrap
@@ -31,6 +31,16 @@ Then read this file fully before doing anything else in this session.
 
 **Working:**
 
+- Release preparation for 0.8.3 is on `codex/release-0.8.3`, based on main
+  `490ffe5`. The maintainer selected 0.8.3, including documented additive API
+  changes. Package metadata, release notes, changelog boundaries, installation
+  examples, and graph upgrade guidance are updated. Keep the existing graph for
+  the first refresh, then sync and review grounding changes. PR #248's initial
+  release-preparation head passed all applicable CI checks. The release date is
+  September 28; the date follow-up needs final CI, and GitHub requires one
+  approving review before normal merge. The maintainer will publish after merge.
+  Verification and remaining publication steps are tracked in
+  `docs/design/0.8.3-release-plan.md`.
 - 0.8.2 setup work on `codex/0.8.2-hub-setup` makes `mex setup` and bare
   `mex` browser entry points; `setup --cli` retains terminal setup and
   `setup --dry-run` remains a read-only terminal preview. Setup commits now

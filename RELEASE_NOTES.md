@@ -1,36 +1,106 @@
-# mex 0.8.2 — Set up in the Hub
+# mex 0.8.3 — Faster graphs, more reliable grounding
 
-MEX setup now starts in your local browser. The terminal setup remains available.
+MEX 0.8.3 makes graph refresh incremental, preserves more knowledge links across
+clones and code changes, and expands route and dependency coverage. It also adds
+scaffold export and Markdown timelines.
 
-## Setup
+## Faster graph maintenance and reads
+
+- Refresh reuses unchanged file extractions and rewrites only changed graph
+  rows. TypeScript and JavaScript dependents are re-extracted when needed;
+  broad compiler or configuration changes fall back to full extraction.
+  Resolution still runs over the whole corpus.
+- A refresh with nothing to publish leaves `graph.db` untouched. JSON output
+  reports the refresh mode, fallback reason, and work performed. The extraction
+  cache adds to local database size.
+- Targeted reads reuse a validated publication audit, and CLI code splitting
+  avoids loading the compiler and terminal UI for lightweight commands.
+
+## Grounding that survives everyday work
+
+- TypeScript node IDs no longer depend on the checkout directory. Type signatures
+  use canonical ordering so incremental and full extraction agree.
+- `mex impact` reads knowledge links from the committed scaffold, so they work
+  on fresh clones. Grounding records take priority over transitive callers when
+  the output budget is tight; `graph get` keeps node metadata when source does
+  not fit. Inline anchors alone are not returned as impact grounding records.
+- `mex check` reads groundings at both the root and under `mex:`. Writers
+  consolidate compatible root entries under `mex.grounds_to`; conflicting
+  entries stay visible for review.
+- Source edits no longer disable all grounding checks. Unchanged files can use
+  the prior snapshot; edited tree-sitter files can be re-extracted locally.
+  Edited TypeScript/JavaScript groundings report `GROUNDING_UNVERIFIED` until
+  refresh rather than appearing clean. Other freshness failures still block
+  checks that cannot be trusted.
+- Small-function renames can reconcile from callers and callees, with an
+  explicit `GROUNDING_MOVED_BY_NEIGHBORS` notice. Equally good candidates remain
+  ambiguous, and inline anchors can use committed fingerprints after rebuilds.
+
+## More project coverage and useful outputs
+
+- New bounded **FastAPI, Flask, and NestJS route resolvers** join Express and
+  Next.js App Router. Static paths and unambiguous same-file handlers are
+  supported; this is not general runtime routing analysis.
+- Dependency checking reads Python `pyproject.toml`, including common optional
+  and grouped dependencies. Architectural labels produce fewer package warnings.
+- Graph commands and doctor report recognized source files with no registered
+  extractor, and status distinguishes uninspected fields from real zero counts.
+- `mex export` bundles scaffold Markdown into one document; use `--out <path>`
+  for a file. `mex timeline --format md` produces a Markdown table for reports.
+- Heartbeat explains when missing `last_updated` fields leave staleness checks
+  inactive, accepts zero-day thresholds, and deduplicates symlinked files.
+- Official Inbox and Relay skills are discoverable through standalone skill
+  installers and Claude Code marketplace metadata. Standalone installation is
+  an alternative to MEX-managed skills; it still requires the CLI and a project.
+
+## Upgrade an existing project
+
+**Keep the old graph for the first refresh.** TypeScript signature fixes can
+change node IDs, and the old index lets refresh retain aliases for those IDs.
 
 ```bash
-npx mex-agent@0.8.2 setup
+npm install -g mex-agent@0.8.3
+mex graph refresh
+mex sync
 ```
 
-- Choose integrations, follow agent population, review the setup-file diff, and explicitly commit it locally in one flow. A manual Git checkpoint remains available.
-- If an agent fails, retry it or copy the retained prompt and continue after manual population. Integration pointer notes are advisory and do not block setup.
-- After the commit, a completion guide explains how to start a fresh agent session and verify its project knowledge. Choose **Open Hub** to enter the full dashboard and its first-run tour.
-- Optionally install `mex` globally at the exact version running setup. Installation has progress, verification, retry, skip, and a copyable terminal command. Failure leaves setup complete.
-- Optionally leave an email and a name for follow-up about MEX. Name is optional; email is required only when submitting. The embedded Web3Forms service handles delivery. Contact details stay out of repository files and usage telemetry; only a submitted/skipped preference is stored on the computer and shared with Overview's invitation.
+The first refresh performs a full extraction with `typescript-5.9-v5`.
+Review the scaffold diff and any ambiguous or missing groundings before
+committing through Git. If the scaffold changed, run `mex wiki rebuild-index`
+to update its local index. A fresh clone or rebuild without the old graph uses
+committed fingerprints and may require manual re-grounding. For an incompatible
+or damaged index, follow the explicit recovery action from `mex graph status`.
 
-Use `mex setup --cli` for the terminal flow and `mex setup --dry-run` for a read-only terminal preview. `--no-open` prints the browser link; `--port <n>` chooses a loopback port. Bare `mex` opens Hub or setup, and `mex tui` keeps the terminal dashboard.
-
-## Also included
-
-- A first-run Hub tour highlights the actual navigation once per checkout; Settings can replay it.
-- Overview links directly to Context when its Wiki index is fresh, and to Health when maintenance is needed.
-- Next.js App Router HTTP handlers become route nodes in the Code Graph.
-- Sync moves inline grounding anchors together with their matching frontmatter entries, preserving the link to moved code.
-
-## Upgrade
+For integrations managed by MEX:
 
 ```bash
-npm install -g mex-agent@0.8.2
 mex skills sync --dry-run
 mex skills sync
 ```
 
-Review integration conflicts and start a fresh agent session. Completed 0.8.0/0.8.1 projects do not need setup again just to upgrade. Automation that expects terminal prompts must now use `setup --cli`.
+Review conflicts and start a fresh agent session. Do not install standalone
+skills over a MEX-managed integration. Completed 0.8.0–0.8.2 setups do not need
+setup again solely to upgrade. New projects can start with
+`npx mex-agent@0.8.3 setup`; terminal setup remains `setup --cli`.
 
-Node.js 22.5 or newer with SQLite FTS5 is required. Package-root exports and Graph/Wiki/Relay storage formats are unchanged. MEX never pushes or pulls; a setup commit is created only from the reviewed Hub action.
+Node.js 22.5 or newer with SQLite FTS5 remains required. Graph schema stays v4
+with an internal extraction cache; canonical Wiki and Relay artifact versions
+are unchanged. Public API additions include the optional
+`HeartbeatResult.filesWithoutLastUpdated` field and three grounding issue codes;
+exhaustive consumers should review [the compatibility guide](COMPATIBILITY.md#additive-api-changes-in-083).
+
+## Contributors
+
+Thanks to everyone who contributed code, tests, documentation, and integration
+work since 0.8.2:
+
+- @theyashasvipandey — incremental refresh and grounding, identity, and path fixes ([#247](https://github.com/mex-memory/mex/pull/247), [#246](https://github.com/mex-memory/mex/pull/246), [#244](https://github.com/mex-memory/mex/pull/244), [#243](https://github.com/mex-memory/mex/pull/243), [#242](https://github.com/mex-memory/mex/pull/242), [#241](https://github.com/mex-memory/mex/pull/241), [#200](https://github.com/mex-memory/mex/pull/200)).
+- @abhinav-phi — Flask/NestJS routes, Python dependencies, claim filtering, coverage, export, timeline, heartbeat, CLI smoke tests, and changelog history ([#177](https://github.com/mex-memory/mex/pull/177), [#102](https://github.com/mex-memory/mex/pull/102), [#185](https://github.com/mex-memory/mex/pull/185), [#186](https://github.com/mex-memory/mex/pull/186), [#175](https://github.com/mex-memory/mex/pull/175), [#183](https://github.com/mex-memory/mex/pull/183), [#182](https://github.com/mex-memory/mex/pull/182), [#181](https://github.com/mex-memory/mex/pull/181), [#178](https://github.com/mex-memory/mex/pull/178), [#184](https://github.com/mex-memory/mex/pull/184)).
+- @sidsri14 — FastAPI routes ([#113](https://github.com/mex-memory/mex/pull/113)).
+- @Kaustubh1235 — targeted-read performance ([#196](https://github.com/mex-memory/mex/pull/196)).
+- @chiliec — impact output priority and honest status fields ([#238](https://github.com/mex-memory/mex/pull/238), [#215](https://github.com/mex-memory/mex/pull/215)).
+- @iveteamorim — graph-get output budgeting ([#239](https://github.com/mex-memory/mex/pull/239)).
+- @architdhamija — skill discoverability ([#245](https://github.com/mex-memory/mex/pull/245)).
+- @theDakshJaitly — skill discovery validation and installer separation, export FIFO safety tests, historical compatibility corrections, README upkeep, and release integration ([skills fixes](https://github.com/mex-memory/mex/commit/e6fa172), [export tests](https://github.com/mex-memory/mex/commit/a0c1a92), [changelog corrections](https://github.com/mex-memory/mex/commit/81d83d2), [README update](https://github.com/mex-memory/mex/commit/5b6e02c)).
+
+**Full changelog:** [v0.8.2…v0.8.3](https://github.com/mex-memory/mex/compare/v0.8.2...v0.8.3).
