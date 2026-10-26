@@ -708,10 +708,10 @@ class GraphEngineImpl implements GraphEngine {
     timeGraphPhase("publish.insert.nodes", () => {
       for (const file of staged.files) for (const node of file.nodes) store.insertNode(node);
     });
+    timeGraphPhase("publish.insert.edges", () => {
+      edgeCount = store.insertEdges(staged.files.flatMap((file) => file.edges));
+    });
     for (const file of staged.files) {
-      const edgesStarted = performance.now();
-      for (const edge of file.edges) if (store.insertEdge(edge)) edgeCount++;
-      recordGraphPhase("publish.insert.edges", performance.now() - edgesStarted);
       // A resolved reference is an edge. Keeping the row too duplicated one
       // for every reference the resolver bound — 27-73% of this table on
       // every repository measured, all of them already in `edges`. Resolution

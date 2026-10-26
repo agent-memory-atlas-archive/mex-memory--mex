@@ -55,6 +55,10 @@ function configureConnection(db: SqliteDatabase): void {
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL"); // safe under WAL
   db.pragma("temp_store = MEMORY");
+  // A rebuild inserts millions of index entries (LSH buckets, edges); the
+  // 2 MiB default page cache turns those into repeated page reads. Pages are
+  // only allocated as they are used, so small graphs keep a small cache.
+  db.pragma("cache_size = -131072");
 }
 
 function configureReadOnlyConnection(db: SqliteDatabase): void {
