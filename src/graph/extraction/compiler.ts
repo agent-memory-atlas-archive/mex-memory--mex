@@ -20,6 +20,7 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { getHeapStatistics } from "node:v8";
 import ts from "typescript";
 import { flushGraphPhaseTimings, phaseTimingsEnabled, recordGraphPhase, timeGraphPhase } from "../phase-timing.js";
 
@@ -540,6 +541,7 @@ export function buildTypeScriptExtraction(
   onFileCaptured?: (completed: number) => void,
 ): CompilerExtractionResult {
   reportedRenderTruncations = 0;
+  liveAfterCollection = getHeapStatistics().used_heap_size;
   recordGraphPhase("compiler.truncatedRenders", 0);
   recordGraphPhase("compiler.renderFallbacks", 0);
   const root = resolve(rootDir);
@@ -836,6 +838,7 @@ export function buildTypeScriptExtraction(
       // inferred and finishing passes. Scope exit alone does not release it.
       program = undefined;
       inputs.releaseProjectSources();
+      collectReleasedProgram();
     }
   }
 
@@ -1905,6 +1908,26 @@ class CompilerInputLedger {
     }
   }
 }
+
+/**
+ * Collect a released program before the next one is built, where the graph
+ * worker allows it (it runs with `--expose-gc`). Its heap limit is sized to
+ * the machine, and under it V8 let released programs pile up: a refresh of a
+ * large monorepo held 7 GB, most of it unreachable.
+ */
+function collectReleasedProgram(): void {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (!gc) return;
+  // A full collection costs time in proportion to what is live, so collect
+  // only once the heap has grown a step past what the last one kept.
+  const used = getHeapStatistics().used_heap_size;
+  if (used < liveAfterCollection + PROGRAM_COLLECTION_STEP_BYTES) return;
+  timeGraphPhase("compiler.gc", gc);
+  liveAfterCollection = getHeapStatistics().used_heap_size;
+}
+
+const PROGRAM_COLLECTION_STEP_BYTES = 1024 * 1024 * 1024;
+let liveAfterCollection = 0;
 
 /** TypeScript's declaration file names, including `.d.<extension>.ts`. */
 const DECLARATION_FILE = /\.d(\.[^./\\]+)?\.[cm]?ts$/iu;

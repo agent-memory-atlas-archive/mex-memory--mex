@@ -159,7 +159,8 @@ function superviseCandidate(options: GraphCandidateProcessOptions, request: Grap
       nodeOptions: process.env.NODE_OPTIONS, execArgv: process.execArgv });
     let child: ChildProcess;
     try {
-      child = spawn(process.execPath, [...heap.args, options.__internal?.entrypoint ?? candidateEntrypoint()], {
+      // --expose-gc lets extraction collect each released compiler program.
+      child = spawn(process.execPath, [...heap.args, "--expose-gc", options.__internal?.entrypoint ?? candidateEntrypoint()], {
         cwd: options.projectRoot,
         env: { ...process.env, ...phaseTimingsWorkerEnv(), MEX_TELEMETRY: "0", DO_NOT_TRACK: "1" },
         // FD 4 is a lifeline. A watchdog in the child observes EOF even while
