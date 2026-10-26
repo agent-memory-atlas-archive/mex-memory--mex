@@ -303,7 +303,7 @@ const specReadService: SpecCliServiceFactory = async () => {
     import("./wiki/application-adapter.js"),
     import("./team/specs/index.js"),
   ]);
-  const graph = createRepositoryGraphPort(projectRoot);
+  const graph = createRepositoryGraphPort(projectRoot, { candidateExecution: "process" });
   const wiki = createRepositoryWikiPort(projectRoot, {
     groundingBridge: graph,
     exclude: readWikiExclude(resolve(projectRoot, ".mex")),
@@ -709,7 +709,7 @@ function wikiIo(): import("./wiki/cli/commands.js").CommandIo {
 async function groundedWikiIo(): Promise<import("./wiki/cli/commands.js").CommandIo> {
   const base = wikiIo();
   const { createRepositoryGraphPort } = await import("./graph/application-adapter.js");
-  return { ...base, groundingBridge: createRepositoryGraphPort(base.projectRoot ?? resolve(base.scaffoldRoot, "..")) };
+  return { ...base, groundingBridge: createRepositoryGraphPort(base.projectRoot ?? resolve(base.scaffoldRoot, ".."), { candidateExecution: "process" }) };
 }
 
 /** The §15.1 filters, added to whichever commands they apply to. */
@@ -883,7 +883,7 @@ async function synthesisIo(): Promise<import("./wiki/cli/commands.js").CommandIo
   return {
     ...base,
     repoRoot: config.projectRoot,
-    synthesisBridge: createRepositoryGraphPort(config.projectRoot),
+    synthesisBridge: createRepositoryGraphPort(config.projectRoot, { candidateExecution: "process" }),
     ...(config.wiki?.synthesis === undefined ? {} : { synthesisScope: config.wiki.synthesis }),
     launchAgent: (playbook: string) => {
       // mex's own launcher, not a second one: six tools, cross-platform

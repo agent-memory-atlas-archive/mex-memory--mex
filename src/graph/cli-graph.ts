@@ -14,6 +14,14 @@ import {
 import { inspectGraphStatus } from "./status.js";
 import { coverageFields, readStoredGraphCoverage, type GraphCoverageObservation } from "./coverage.js";
 
+/**
+ * CLI maintenance builds in the graph worker, as the Hub does: the worker gets
+ * a heap sized to the machine (see `graphWorkerHeap`) and a heap failure is
+ * reported with its cause instead of crashing this process at Node's default
+ * limit, which a large TypeScript monorepo exceeds.
+ */
+const CLI_GRAPH_EXECUTION = { candidateExecution: "process" } as const;
+
 export interface GraphCommandOptions {
   /** Project root to inspect or maintain (defaults to cwd). */
   root?: string;
@@ -26,7 +34,7 @@ export interface GraphCommandOptions {
 /** Explicit correctness-first refresh through the existing full semantic sync path. */
 export async function runGraphRefresh(options: GraphCommandOptions = {}): Promise<void> {
   const rootDir = options.root ?? process.cwd();
-  const result = await refreshGraph(rootDir);
+  const result = await refreshGraph(rootDir, CLI_GRAPH_EXECUTION);
   const coverage = await readStoredGraphCoverage(rootDir, result.status.status === "fresh");
   if (options.json) console.log(JSON.stringify({ ...result, ...coverageFields(coverage) }, null, 2));
   else {
@@ -38,7 +46,7 @@ export async function runGraphRefresh(options: GraphCommandOptions = {}): Promis
 /** Explicit isolated candidate rebuild with atomic publication and recovery. */
 export async function runGraphRebuild(options: GraphCommandOptions = {}): Promise<void> {
   const rootDir = options.root ?? process.cwd();
-  const result = await rebuildGraph(rootDir);
+  const result = await rebuildGraph(rootDir, CLI_GRAPH_EXECUTION);
   const coverage = await readStoredGraphCoverage(rootDir, result.status.status === "fresh");
   if (options.json) console.log(JSON.stringify({ ...result, ...coverageFields(coverage) }, null, 2));
   else {
@@ -50,7 +58,7 @@ export async function runGraphRebuild(options: GraphCommandOptions = {}): Promis
 /** Ensure a current graph, reusing a fresh store without writing. */
 export async function runGraph(options: GraphCommandOptions = {}): Promise<void> {
   const rootDir = options.root ?? process.cwd();
-  const result = await ensureGraphCurrent(rootDir, { force: options.force });
+  const result = await ensureGraphCurrent(rootDir, { ...CLI_GRAPH_EXECUTION, force: options.force });
   const coverage = await readStoredGraphCoverage(rootDir, result.status.status === "fresh");
   if (options.json) {
     console.log(JSON.stringify({
