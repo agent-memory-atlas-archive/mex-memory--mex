@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Setup end-to-end coverage uses deterministic fake agents for both supported launchers, phase interruption, fresh clones, concurrency and the browser flow; the optional smoke workflow needs no paid sessions or API secrets (#292).
+
 - Setup and `mex skills sync` no longer refuse a managed skill whose files differ from what MEX installed only in line endings. Git checks text files out with CRLF under `core.autocrlf=true`, the Windows default, so a Windows clone of a set-up repository failed setup with "Official MEX agent assets have conflicts". A CRLF checkout of an unmodified skill is now left as it is, updated normally when the package changes, and a real edit is still preserved and reported (#308).
   Ownership hashes recorded from a CRLF package are also recognized in an LF checkout. Only UTF-8 text is compared across line endings; binary files, BOMs, trailing-newline changes, and edits after preview still require exact preservation.
 - Setup pauses when an agent reaches its usage limit, reports the reset time when available, and keeps finished work. Rerun `mex setup` after the limit resets to continue.
