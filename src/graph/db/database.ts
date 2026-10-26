@@ -18,7 +18,7 @@ import { dirname } from "node:path";
 import { schemaPath } from "../assets.js";
 import { GRAPH_CORPUS_LIMITS } from "../corpus-policy.js";
 import { GraphRebuildRequiredError } from "../errors.js";
-import { bandHashInts, bandHashes, decodeMinhash, encodeMinhash } from "../fingerprint.js";
+import { bandHashInts, bandHashes, decodeMinhash, encodeMinhash, indexedInLsh } from "../fingerprint.js";
 import type { Fingerprint } from "../reconcile.js";
 import {
   GRAPH_SNAPSHOT_METADATA_KEY,
@@ -920,6 +920,8 @@ function validateCombinedSchema(db: SqliteDatabase): void {
     if (!bucketStep.done && BigInt(bucketStep.value.ref) < BigInt(row.ref)) {
       throw incompatibleSchema("LSH contains rows without a fingerprint owner.");
     }
+    // A small fingerprint may own no buckets (see `indexedInLsh`).
+    if (!indexedInLsh(fingerprint) && (bucketStep.done || bucketStep.value.ref !== row.ref)) continue;
     for (const entry of expected) {
       if (
         bucketStep.done
