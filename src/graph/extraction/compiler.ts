@@ -591,6 +591,7 @@ export function buildTypeScriptExtraction(
   const reusedCaptures = new Map<string, CompilerFileCapture>();
   const projectStates: Record<string, string> = {};
   const projectStateInputs = new Map<string, string[]>();
+  const projectManifests = new Map<string, string[]>();
   const projectInputs: Record<string, CompilerProjectInputs> = {};
   const incremental = options.incremental;
   const rootPrefix = `${normalizedAbsolute(root)}/`;
@@ -620,9 +621,13 @@ export function buildTypeScriptExtraction(
       stateInputs.push({ absolute, text });
     }
     if (projectStateDigest(root, stateInputs) !== incremental.projectStates[project.id]) return false;
+    // Replay the reads, recording them again: a file deleted since is no
+    // longer read. Manifests are the program's own and carry over.
     inputs.trackProjectReads();
     for (const path of recorded.observed) inputs.readFile(absoluteCandidate(root, path));
-    projectInputs[project.id] = { observed: inputs.takeProjectReads(), state: recorded.state };
+    const observed = new Set(inputs.takeProjectReads().filter((path) => !PACKAGE_JSON.test(path)));
+    for (const path of recorded.observed) if (PACKAGE_JSON.test(path)) observed.add(path);
+    projectInputs[project.id] = { observed: [...observed].sort(compareCodePoints), state: recorded.state };
     projectStates[project.id] = incremental.projectStates[project.id]!;
     for (const path of owned) {
       const absoluteFile = absoluteCandidate(root, path);
@@ -665,6 +670,7 @@ export function buildTypeScriptExtraction(
     const { state, inputs: stateInputs } = projectInputState(program, root, candidateSet, dependenciesByFile);
     projectStates[project.id] = state;
     projectStateInputs.set(project.id, stateInputs);
+    projectManifests.set(project.id, programPackageManifests(program, root));
     const signatures = new Map<string, string | undefined>();
     const signatureOf = (filePath: string): string | undefined => {
       if (signatures.has(filePath)) return signatures.get(filePath);
@@ -909,7 +915,14 @@ export function buildTypeScriptExtraction(
     }
     try {
       timeGraphPhase("compiler.capture", () => processProject(project, program!, owned));
-      projectInputs[project.id] = { observed: inputs.takeProjectReads(), state: projectStateInputs.get(project.id) ?? [] };
+      // Manifests come from the program itself; a tracked manifest read is
+      // whichever program happened to read it first.
+      const observed = new Set(inputs.takeProjectReads().filter((path) => !PACKAGE_JSON.test(path)));
+      for (const manifest of projectManifests.get(project.id) ?? []) observed.add(manifest);
+      projectInputs[project.id] = {
+        observed: [...observed].sort(compareCodePoints),
+        state: projectStateInputs.get(project.id) ?? [],
+      };
     } finally {
       // V8 can keep the loop's captured context on the stack through the
       // inferred and finishing passes. Scope exit alone does not release it.
@@ -1093,16 +1106,48 @@ interface FileDependencies {
 
 interface ProgramResolutions {
   forEachResolvedModule?(
-    callback: (resolution: { resolvedModule?: ts.ResolvedModuleFull; failedLookupLocations?: readonly string[] }) => void,
+    callback: (resolution: {
+      resolvedModule?: ts.ResolvedModuleFull;
+      failedLookupLocations?: readonly string[];
+      affectingLocations?: readonly string[];
+    }) => void,
     file: ts.SourceFile,
   ): void;
   forEachResolvedTypeReferenceDirective?(
     callback: (resolution: {
       resolvedTypeReferenceDirective?: ts.ResolvedTypeReferenceDirective;
       failedLookupLocations?: readonly string[];
+      affectingLocations?: readonly string[];
     }) => void,
     file: ts.SourceFile,
   ): void;
+}
+
+const PACKAGE_JSON = /(^|\/)package\.json$/u;
+
+/**
+ * The package manifests a program depends on, from its own resolutions and
+ * each file's module-format scope. Resolutions and manifest contents are
+ * cached across programs, so which program reads a manifest first depends
+ * on the order programs were built in; these are each program's own, so a
+ * project reused without its program (#281) replays the same manifests in
+ * any history.
+ */
+function programPackageManifests(program: ts.Program, root: string): string[] {
+  const resolutions = program as ts.Program & ProgramResolutions;
+  const manifests = new Set<string>();
+  const add = (locations: readonly string[] | undefined): void => {
+    for (const location of locations ?? []) {
+      const absolute = normalizedAbsolute(location);
+      if (PACKAGE_JSON.test(absolute) && withinRoot(root, absolute)) manifests.add(relativePath(root, absolute));
+    }
+  };
+  for (const sourceFile of program.getSourceFiles()) {
+    add((sourceFile as ts.SourceFile & { packageJsonLocations?: readonly string[] }).packageJsonLocations);
+    resolutions.forEachResolvedModule?.((resolution) => add(resolution.affectingLocations), sourceFile);
+    resolutions.forEachResolvedTypeReferenceDirective?.((resolution) => add(resolution.affectingLocations), sourceFile);
+  }
+  return [...manifests];
 }
 
 /**
