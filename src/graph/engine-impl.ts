@@ -61,6 +61,7 @@ import {
   type CompilerExtractedNode,
   type CompilerExtractionOptions,
   type CompilerIncrementalInput,
+  type CompilerProjectInputs,
   type CompilerExtractionResult,
   type CompilerFileExtraction,
   type CompilerSemanticInput,
@@ -332,6 +333,7 @@ interface StagedExtraction {
 interface ExtractionCacheState {
   identity: string;
   projectStates: Record<string, string>;
+  projectInputs: Record<string, CompilerProjectInputs>;
   entries: Array<{ path: string; contentHash: string; payload: Uint8Array; changed: boolean }>;
 }
 
@@ -340,6 +342,7 @@ interface ExtractionReuse {
   identity: string | null;
   stored: Map<string, StoredExtraction>;
   projectStates: Record<string, string>;
+  projectInputs?: Record<string, CompilerProjectInputs>;
   /** Stored fingerprint sketches by node id; neighbours are always recomputed. */
   fingerprints: ReadonlyMap<string, Pick<Fingerprint, "minhash" | "tokenCount">>;
   /** Stored file records, to know which files' sketches still hold. */
@@ -348,6 +351,49 @@ interface ExtractionReuse {
 
 const EXTRACTION_CACHE_IDENTITY_KEY = "extraction_cache_identity";
 const EXTRACTION_PROJECT_STATES_KEY = "extraction_project_states";
+const EXTRACTION_PROJECT_INPUTS_KEY = "extraction_project_inputs";
+/** Past this, project inputs are not recorded and every refresh builds every program. */
+const MAX_PROJECT_INPUTS_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Project inputs (#281) with each path stored once: a monorepo's projects
+ * read largely the same files.
+ */
+function encodeProjectInputs(inputs: Record<string, CompilerProjectInputs>): string | undefined {
+  const paths: string[] = [];
+  const index = new Map<string, number>();
+  const intern = (path: string): number => {
+    let at = index.get(path);
+    if (at === undefined) {
+      at = paths.length;
+      paths.push(path);
+      index.set(path, at);
+    }
+    return at;
+  };
+  const projects = Object.fromEntries(Object.entries(inputs).sort(([left], [right]) => compareCodePoints(left, right))
+    .map(([id, entry]) => [id, { observed: entry.observed.map(intern), state: entry.state.map(intern) }]));
+  const encoded = JSON.stringify({ paths, projects });
+  return encoded.length <= MAX_PROJECT_INPUTS_BYTES ? encoded : undefined;
+}
+
+function decodeProjectInputs(encoded: string | null): Record<string, CompilerProjectInputs> | undefined {
+  if (!encoded) return undefined;
+  try {
+    const { paths, projects } = JSON.parse(encoded) as {
+      paths: string[]; projects: Record<string, { observed: number[]; state: number[] }>;
+    };
+    const resolve = (at: number): string => {
+      const path = paths[at];
+      if (typeof path !== "string") throw new Error("invalid project input");
+      return path;
+    };
+    return Object.fromEntries(Object.entries(projects)
+      .map(([id, entry]) => [id, { observed: entry.observed.map(resolve), state: entry.state.map(resolve) }]));
+  } catch {
+    return undefined;
+  }
+}
 
 class GraphEngineImpl implements GraphEngine {
   private readonly rootDir: string;
@@ -660,6 +706,9 @@ class GraphEngineImpl implements GraphEngine {
       store.setMetadata(GRAPH_SNAPSHOT_METADATA_KEY, serializedSnapshot);
       store.setMetadata(EXTRACTION_CACHE_IDENTITY_KEY, staged.extraction.cache.identity);
       store.setMetadata(EXTRACTION_PROJECT_STATES_KEY, JSON.stringify(staged.extraction.cache.projectStates));
+      const projectInputs = encodeProjectInputs(staged.extraction.cache.projectInputs);
+      if (projectInputs === undefined) store.deleteMetadata(EXTRACTION_PROJECT_INPUTS_KEY);
+      else store.setMetadata(EXTRACTION_PROJECT_INPUTS_KEY, projectInputs);
       if ("reason" in grouped) store.deleteMetadata(INCREMENTAL_STATE_METADATA_KEY);
       else store.setMetadata(INCREMENTAL_STATE_METADATA_KEY, incrementalStateMarker(serializedSnapshot));
       markGraphReady(this.db!, staged.manifestHash);
@@ -892,6 +941,7 @@ function loadExtractionReuse(store: GraphStore, root: string): ExtractionReuse |
     identity: store.getMetadata(EXTRACTION_CACHE_IDENTITY_KEY),
     stored: store.getExtractionCache(),
     projectStates,
+    projectInputs: decodeProjectInputs(store.getMetadata(EXTRACTION_PROJECT_INPUTS_KEY)),
     fingerprints,
     records: new Map(store.getAllFileRecords().map((record) => [record.path, record])),
   };
@@ -1007,6 +1057,7 @@ async function stageCorpus(
             importers: plan.importers,
             maxAffected: incrementalClosureBudget(compilerPaths.length),
             projectStates: (reuse as ExtractionReuse).projectStates,
+            projectInputs: (reuse as ExtractionReuse).projectInputs,
           });
         } catch (error) {
           if (!(error instanceof CompilerIncrementalFallback)) throw error;
@@ -1136,6 +1187,7 @@ async function stageCorpus(
         cache: {
           identity,
           projectStates: compiler.projectStates,
+          projectInputs: compiler.projectInputs,
           entries: discovered.flatMap((file) => cacheEntries.get(file.relPath) ?? []),
         },
       },

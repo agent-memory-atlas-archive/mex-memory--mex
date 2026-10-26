@@ -208,6 +208,8 @@ export interface CompilerExtractionResult {
   captures: CompilerFileCapture[];
   /** Per project: a digest of every program input that is visible without an import. */
   projectStates: Record<string, string>;
+  /** Per project: the inputs its program read; see {@link CompilerProjectInputs}. */
+  projectInputs: Record<string, CompilerProjectInputs>;
   /** Files captured from a live program in this run. */
   recaptured: number;
   /** Repository-relative paths whose previous capture was reused unchanged. */
@@ -273,6 +275,22 @@ export interface CompilerIncrementalInput {
   maxAffected?: number;
   /** `projectStates` of the previous extraction. */
   projectStates: Readonly<Record<string, string>>;
+  /** `projectInputs` of the previous extraction, when it recorded them. */
+  projectInputs?: Readonly<Record<string, CompilerProjectInputs>>;
+}
+
+/**
+ * What one project's program read (#281), so an incremental refresh can tell
+ * that a project is unchanged without building its program again.
+ */
+export interface CompilerProjectInputs {
+  /** Repository-relative corpus and project files it read, present or absent. */
+  observed: string[];
+  /**
+   * The inputs its `projectStates` digest covers: root-relative inside the
+   * root, otherwise absolute.
+   */
+  state: string[];
 }
 
 /** A condition only a full extraction can honour; the caller extracts in full. */
@@ -572,12 +590,59 @@ export function buildTypeScriptExtraction(
   const dependenciesByFile = new Map<string, FileDependencies>();
   const reusedCaptures = new Map<string, CompilerFileCapture>();
   const projectStates: Record<string, string> = {};
+  const projectStateInputs = new Map<string, string[]>();
+  const projectInputs: Record<string, CompilerProjectInputs> = {};
   const incremental = options.incremental;
   const rootPrefix = `${normalizedAbsolute(root)}/`;
   const reusedFiles: string[] = [];
   let recaptured = 0;
   const affected = new Set(incremental?.affected ?? []);
   const signaturesByFile = new Map<string, Array<[string, string]>>();
+  const unchangedProjects = incremental ? unchangedProjectPlan(incremental, candidates, root) : undefined;
+
+  // An incremental refresh (#281) builds no program for a project whose
+  // previous program read none of the changed files, through any file it
+  // owned, and whose other inputs still hash as they did: it reuses every
+  // capture it owned and replays its reads, so the result is the one its
+  // program would give. Ownership by earlier projects must not have moved.
+  const reuseUnchangedProject = (project: ParsedProject): boolean => {
+    const recorded = incremental?.projectInputs?.[project.id];
+    const owned = unchangedProjects?.ownedByProject.get(project.id) ?? [];
+    if (!incremental || !unchangedProjects?.enabled || !recorded) return false;
+    if (owned.some((path) => unchangedProjects.touched.has(path) || claimed.has(absoluteCandidate(root, path)))) {
+      return false;
+    }
+    const stateInputs: Array<{ absolute: string; text: string }> = [];
+    for (const input of recorded.state) {
+      const absolute = isAbsolute(input) ? normalizedAbsolute(input) : absoluteCandidate(root, input);
+      const text = inputs.readFile(absolute);
+      if (text === undefined) return false;
+      stateInputs.push({ absolute, text });
+    }
+    if (projectStateDigest(root, stateInputs) !== incremental.projectStates[project.id]) return false;
+    inputs.trackProjectReads();
+    for (const path of recorded.observed) inputs.readFile(absoluteCandidate(root, path));
+    projectInputs[project.id] = { observed: inputs.takeProjectReads(), state: recorded.state };
+    projectStates[project.id] = incremental.projectStates[project.id]!;
+    for (const path of owned) {
+      const absoluteFile = absoluteCandidate(root, path);
+      const previous = incremental.previous.get(path)!;
+      const captured = restoreCapture(previous, rootPrefix);
+      claimed.add(absoluteFile);
+      dependenciesByFile.set(absoluteFile, {
+        dependencies: previous.dependencies,
+        failedLookups: previous.failedLookups,
+        globalScope: previous.globalScope,
+      });
+      for (const [location, id] of captured.locations) locationIds.set(location, id);
+      for (const node of captured.nodes) nodeById.set(node.id, node);
+      capturedByFile.set(absoluteFile, captured);
+      reusedCaptures.set(absoluteFile, previous);
+      reusedFiles.push(path);
+      onFileCaptured?.(capturedByFile.size);
+    }
+    return true;
+  };
 
   // Stage one project's owned files while its program is alive; retain only
   // plain data. Nothing stored here references the program, checker, or AST.
@@ -597,8 +662,9 @@ export function buildTypeScriptExtraction(
         );
       }
     }
-    const state = projectInputState(program, root, candidateSet, dependenciesByFile);
+    const { state, inputs: stateInputs } = projectInputState(program, root, candidateSet, dependenciesByFile);
     projectStates[project.id] = state;
+    projectStateInputs.set(project.id, stateInputs);
     const signatures = new Map<string, string | undefined>();
     const signatureOf = (filePath: string): string | undefined => {
       if (signatures.has(filePath)) return signatures.get(filePath);
@@ -785,6 +851,7 @@ export function buildTypeScriptExtraction(
     // Later projects cannot contribute facts once every candidate has an owner.
     // Avoid constructing another program and checker for those empty projects.
     if (candidates.length > 0 && claimed.size === candidates.length) break;
+    if (reuseUnchangedProject(project)) continue;
     // Root only what this project can still own: candidates no more specific
     // project claimed, plus declaration files for ambient types. Files those
     // roots import still load. A broad config (a repository-root tsconfig
@@ -802,6 +869,7 @@ export function buildTypeScriptExtraction(
     // failure to this project so its files fall back to tree-sitter extraction
     // instead of aborting the whole corpus (issue #140 follow-up finding).
     let program: ts.Program | undefined;
+    inputs.trackProjectReads();
     const programStarted = performance.now();
     try {
       program = createProgram({
@@ -813,6 +881,7 @@ export function buildTypeScriptExtraction(
         host: inputs.compilerHost({ ...project.parsed.options, skipLibCheck: true, noEmit: true }),
       });
     } catch {
+      inputs.takeProjectReads();
       inputs.releaseProjectSources();
       crashedProjects.add(project);
       // Poison only files no healthier, more specific project has already
@@ -831,8 +900,16 @@ export function buildTypeScriptExtraction(
       catch { return false; }
     });
     for (const file of owned) claimed.add(file);
+    if (unchangedProjects?.enabled) {
+      // A project that owns other files than before can move ownership for
+      // every later project, so none of those is reused unbuilt.
+      const before = unchangedProjects.ownedByProject.get(project.id) ?? [];
+      const now = owned.map((file) => relativePath(root, file)).sort(compareCodePoints);
+      if (before.join("\n") !== now.join("\n")) unchangedProjects.enabled = false;
+    }
     try {
       timeGraphPhase("compiler.capture", () => processProject(project, program!, owned));
+      projectInputs[project.id] = { observed: inputs.takeProjectReads(), state: projectStateInputs.get(project.id) ?? [] };
     } finally {
       // V8 can keep the loop's captured context on the stack through the
       // inferred and finishing passes. Scope exit alone does not release it.
@@ -962,9 +1039,44 @@ export function buildTypeScriptExtraction(
     declinedInputs: inputs.declinedConfigInputs(),
     captures,
     projectStates,
+    projectInputs,
     recaptured,
     reused: reusedFiles.sort(compareCodePoints),
   };
+}
+
+/**
+ * Which projects an incremental refresh may reuse without a program (#281):
+ * only when every candidate already had a capture (no file was added or
+ * removed) and no changed file is visible without an import. `touched` holds
+ * every changed path and everything that imports one, transitively; a project
+ * owning any of them is built.
+ */
+function unchangedProjectPlan(
+  incremental: CompilerIncrementalInput,
+  candidates: readonly string[],
+  root: string,
+): { enabled: boolean; touched: Set<string>; ownedByProject: Map<string, string[]> } {
+  const ownedByProject = new Map<string, string[]>();
+  for (const [path, capture] of incremental.previous) {
+    const owned = ownedByProject.get(capture.projectId) ?? [];
+    owned.push(path);
+    ownedByProject.set(capture.projectId, owned);
+  }
+  for (const owned of ownedByProject.values()) owned.sort(compareCodePoints);
+  const touched = new Set<string>();
+  const queue = [...incremental.affected, ...incremental.gated, ...incremental.modified];
+  while (queue.length > 0) {
+    const path = queue.pop()!;
+    if (touched.has(path)) continue;
+    touched.add(path);
+    for (const importer of incremental.importers.get(path) ?? []) queue.push(importer);
+  }
+  const sameCorpus = candidates.length === incremental.previous.size
+    && candidates.every((file) => incremental.previous.has(relativePath(root, file)));
+  const globalChange = [...incremental.modified, ...incremental.gated]
+    .some((path) => incremental.previous.get(path)?.globalScope !== false);
+  return { enabled: Boolean(incremental.projectInputs) && sameCorpus && !globalChange, touched, ownedByProject };
 }
 
 function sameDependencies(current: FileDependencies, previous: FileDependencies): boolean {
@@ -1086,16 +1198,25 @@ function projectInputState(
   root: string,
   candidates: ReadonlySet<string>,
   dependencies: ReadonlyMap<string, FileDependencies>,
-): string {
-  const entries: string[] = [];
+): { state: string; inputs: string[] } {
+  const inputs: Array<{ absolute: string; text: string }> = [];
   for (const sourceFile of program.getSourceFiles()) {
     const absolute = normalizedAbsolute(sourceFile.fileName);
     if (candidates.has(absolute)) {
       const global = dependencies.get(absolute)?.globalScope ?? isGlobalScopeSource(sourceFile);
       if (!global) continue;
     }
-    entries.push(`${portableInputPath(root, absolute)}\u0000${sha256(sourceFile.text)}`);
+    inputs.push({ absolute, text: sourceFile.text });
   }
+  return {
+    state: projectStateDigest(root, inputs),
+    inputs: inputs.map(({ absolute }) => withinRoot(root, absolute) ? relativePath(root, absolute) : absolute)
+      .sort(compareCodePoints),
+  };
+}
+
+function projectStateDigest(root: string, inputs: ReadonlyArray<{ absolute: string; text: string }>): string {
+  const entries = inputs.map(({ absolute, text }) => `${portableInputPath(root, absolute)}\u0000${sha256(text)}`);
   entries.sort(compareCodePoints);
   return sha256(entries.join("\n"));
 }
@@ -1472,6 +1593,8 @@ class CompilerInputLedger {
   private moduleResolutionCache: ts.ModuleResolutionCache | undefined;
   private libraryResolutionCache: ts.ModuleResolutionCache | undefined;
   private candidates: string[] = [];
+  /** Corpus and project files the current project has read, while tracked. */
+  private projectReads: Set<string> | undefined;
 
   constructor(root: string, private readonly options: CompilerExtractionOptions) {
     this.root = resolve(root);
@@ -1506,17 +1629,34 @@ class CompilerInputLedger {
       .sort(compareCodePoints);
   }
 
+  /** Start recording the corpus and project files one project reads. */
+  trackProjectReads(): void {
+    this.projectReads = new Set();
+  }
+
+  /** The files read since {@link trackProjectReads}, repository-relative; stops recording. */
+  takeProjectReads(): string[] {
+    const reads = [...this.projectReads ?? []].map((file) => relativePath(this.root, file)).sort(compareCodePoints);
+    this.projectReads = undefined;
+    return reads;
+  }
+
   readFile(fileName: string): string | undefined {
     const absolute = absoluteCandidate(this.root, fileName);
     const staged = this.staged.get(absolute);
     if (staged !== undefined) {
       this.observe(absolute, staged);
+      this.projectReads?.add(absolute);
       return staged;
     }
     if (!withinRoot(this.root, absolute) || !this.isProjectInput(absolute)) {
       return isAllowedCompilerDependency(absolute) ? this.readDependency(absolute, fileName) : undefined;
     }
-    if (this.cache.has(absolute)) return this.cache.get(absolute);
+    if (this.cache.has(absolute)) {
+      const cached = this.cache.get(absolute);
+      this.recordProjectRead(absolute, cached);
+      return cached;
+    }
     const source = this.options.readProjectFile
       ? this.options.readProjectFile(absolute)
       : ts.sys.readFile(fileName);
@@ -1526,7 +1666,13 @@ class CompilerInputLedger {
       this.observe(absolute, source);
     }
     else this.observeMissing(absolute);
+    this.recordProjectRead(absolute, source);
     return source;
+  }
+
+  /** Recorded as the ledger observes it: a missing file the corpus policy covers is no input. */
+  private recordProjectRead(absolute: string, source: string | undefined): void {
+    if (source !== undefined || !negativeProbeCoveredByCorpusPolicy(absolute)) this.projectReads?.add(absolute);
   }
 
   /** A dependency outside the corpus, read once per extraction like every other input. */

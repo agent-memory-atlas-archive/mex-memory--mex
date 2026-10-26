@@ -17,6 +17,7 @@
 import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import ts from "typescript";
 import { afterEach, describe, expect, it } from "vitest";
 import { incrementalClosureBudget } from "../extraction-cache.js";
 import { createGraphEngine, GraphSourceStagingError, type GraphRefreshStrategy } from "../engine-impl.js";
@@ -28,7 +29,7 @@ import { createGroundingGraph, deriveGrounding, type GroundingGraph } from "../.
 import { resolveGrounding } from "../../wiki/grounding/resolve.js";
 import { diffGraphDumps, dumpGraphDatabase, type GraphDump } from "./graph-dump.js";
 import {
-  all, FIXTURES, PYTHON_FIXTURE, random, replace, TS_FIXTURE, write, writeTree,
+  all, FIXTURES, MONOREPO_FIXTURE, PYTHON_FIXTURE, random, replace, TS_FIXTURE, write, writeTree,
   type Edit, type Fixture,
 } from "./refresh-fixtures.js";
 
@@ -229,6 +230,53 @@ function withGroundingGraph<T>(root: string, dbPath: string, body: (graph: Groun
 // Grounding continuity (MOVED / AMBIGUOUS / GONE) reads node ids, aliases and
 // fingerprints; the alias equality above covers it table by table, and this
 // walks one grounded symbol across an incremental move end to end.
+describe("incremental refresh of a monorepo", () => {
+  it("builds programs only for the projects that read a changed file (#281)", async () => {
+    const root = tempDir("mex-incr-projects-");
+    const dbPath = join(tempDir("mex-incr-projects-store-"), "graph.db");
+    writeTree(root, MONOREPO_FIXTURE.files);
+    let built: string[] = [];
+    const countPrograms = (): void => {
+      built = [];
+    };
+    const run = async (operation: "build" | "sync"): Promise<BuildResult> => {
+      const engine = createGraphEngine({
+        rootDir: root,
+        dbPath,
+        compilerExtraction: {
+          programFactory(options: ts.CreateProgramOptions) {
+            built.push(String(options.rootNames.find((name) => !/\.d\.ts$/u.test(name))).replace(/^.*packages\/([^/]+)\/.*$/u, "$1"));
+            return ts.createProgram(options);
+          },
+        },
+        __internalRefreshStrategy: "incremental",
+      } as Parameters<typeof createGraphEngine>[0]);
+      try {
+        return operation === "build" ? await engine.build(root) : await engine.sync([]);
+      } finally {
+        engine.close();
+      }
+    };
+    await run("build");
+    expect(built.sort()).toEqual(["app", "core", "tools"]);
+
+    countPrograms();
+    replace("packages/tools/src/report.ts", "lint(source)", "lint(source.trim())")(root);
+    expect((await run("sync")).refresh?.mode).toBe("incremental");
+    expect(built).toEqual(["tools"]);
+
+    countPrograms();
+    replace("packages/core/src/math.ts", "return a + b;", "return b + a;")(root);
+    expect((await run("sync")).refresh?.mode).toBe("incremental");
+    expect(built.sort()).toEqual(["app", "core"]);
+
+    countPrograms();
+    write("packages/tools/src/extra.ts", "export const extra = 1;\n")(root);
+    await run("sync");
+    expect(built.sort()).toEqual(["app", "core", "tools"]);
+  }, 120_000);
+});
+
 describe("grounding across an incremental move", () => {
   it("resolves a grounded function moved to another file exactly as the oracle does", async () => {
     const body = "export function rotateRefreshToken(userId: string): number {\n  const windowSeconds = 3600;\n  const attempts = userId.length;\n  const budget = attempts * windowSeconds;\n  return budget > 100 ? budget : windowSeconds;\n}\n";
