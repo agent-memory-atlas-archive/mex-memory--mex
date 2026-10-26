@@ -26,7 +26,9 @@ import { flushGraphPhaseTimings, phaseTimingsEnabled, recordGraphPhase, timeGrap
 // v3 (#240): checker-rendered signatures no longer embed absolute module paths.
 // v4 (#209): checker-rendered unions list their members in one canonical order.
 // v6: property-assigned function values retain their authored target name.
-export const TYPESCRIPT_COMPILER_EXTRACTOR_VERSION = "typescript-5.9-v6";
+// v7 (#281): out-of-scope aliases render by name, and calls carry no rendered
+// signature evidence.
+export const TYPESCRIPT_COMPILER_EXTRACTOR_VERSION = "typescript-5.9-v7";
 export const TYPESCRIPT_COMPILER_VERSION = ts.version;
 
 export type CompilerSourceLanguage =
@@ -338,8 +340,6 @@ interface RuntimeProject extends ParsedProject {
   checker: ts.TypeChecker;
   /** Project root that checker-rendered module paths are made relative to. */
   root: string;
-  /** Call-site signature text, by the scope it was rendered in; see {@link renderCallSignature}. */
-  callSignatureTexts: Map<ts.Node, Map<ts.Signature, string>>;
 }
 
 interface ErrorRange {
@@ -420,7 +420,7 @@ export type CapturedReference =
   | {
       form: "call"; position: number; line: number; column: number; sourceId: string;
       isNew: boolean; targetName: string; receiver?: string; polymorphic: boolean;
-      candidateLocations: readonly string[]; expressionText: string; signatureText?: string;
+      candidateLocations: readonly string[]; expressionText: string;
     }
   | {
       form: "heritage"; position: number; line: number; column: number; sourceId: string;
@@ -581,7 +581,7 @@ export function buildTypeScriptExtraction(
   // plain data. Nothing stored here references the program, checker, or AST.
   const processProject = (project: ParsedProject, program: ts.Program, owned: readonly string[]): void => {
     const runtime: RuntimeProject = {
-      ...project, program, checker: program.getTypeChecker(), root, callSignatureTexts: new Map(),
+      ...project, program, checker: program.getTypeChecker(), root,
     };
     const replayedResolutions = new Set<string>();
     // Files importing the same specifier from one directory share a resolution.
@@ -783,6 +783,18 @@ export function buildTypeScriptExtraction(
     // Later projects cannot contribute facts once every candidate has an owner.
     // Avoid constructing another program and checker for those empty projects.
     if (candidates.length > 0 && claimed.size === candidates.length) break;
+    // Root only what this project can still own: candidates no more specific
+    // project claimed, plus declaration files for ambient types. Files those
+    // roots import still load. A broad config (a repository-root tsconfig
+    // that matches every file) otherwise rebuilds a whole-repository program
+    // to extract a handful of leftovers, and a project with nothing left to
+    // own is skipped without a program.
+    const rootNames = project.parsed.fileNames.filter((file) => {
+      if (DECLARATION_FILE.test(file)) return true;
+      const absolute = normalizedAbsolute(file);
+      return candidateSet.has(absolute) && !claimed.has(absolute) && !poisonedFiles.has(absolute);
+    });
+    if (!rootNames.some((file) => !DECLARATION_FILE.test(file))) continue;
     // Program creation parses every root file; a single malformed source (e.g.
     // a hostile test fixture) can hit a TS-internal assertion. Isolate the
     // failure to this project so its files fall back to tree-sitter extraction
@@ -791,7 +803,7 @@ export function buildTypeScriptExtraction(
     const programStarted = performance.now();
     try {
       program = createProgram({
-        rootNames: project.parsed.fileNames,
+        rootNames,
         // Never type-check library .d.ts or emit: extraction only needs the
         // checker's lazy symbol/type queries, not a full compile.
         options: { ...project.parsed.options, skipLibCheck: true, noEmit: true },
@@ -1728,13 +1740,14 @@ class CompilerInputLedger {
         this.sourceFiles.delete(key);
         this.sourceFileBytes -= shared.text.length * 2;
       }
-      const parsed = ts.createSourceFile(
+      const parsed = timeGraphPhase("compiler.parse", () => ts.createSourceFile(
         fileName,
         source,
         languageVersionOrOptions,
         true,
         scriptKindForFile(fileName),
-      );
+      ));
+      recordGraphPhase("compiler.parsedFiles", 1);
       // Bound both text and entry count: bound ASTs/symbols are much larger
       // than their source, and an extraction can visit many disjoint projects.
       // Eviction only removes the ledger's reference; an active program still
@@ -1896,8 +1909,11 @@ class CompilerInputLedger {
 /** TypeScript's declaration file names, including `.d.<extension>.ts`. */
 const DECLARATION_FILE = /\.d(\.[^./\\]+)?\.[cm]?ts$/iu;
 
-const MAX_SHARED_SOURCE_FILES = 512;
-const MAX_SHARED_SOURCE_BYTES = 16 * 1024 * 1024;
+// Declarations shared across a monorepo's projects (dependencies above all)
+// are parsed once while they fit. Each MiB of text holds several MiB of
+// bound syntax tree, so this trades heap for parse time.
+const MAX_SHARED_SOURCE_FILES = 16_384;
+const MAX_SHARED_SOURCE_BYTES = 64 * 1024 * 1024;
 
 /**
  * The compiler options a parsed and bound source file depends on: the set
@@ -2484,7 +2500,6 @@ function finishReferences(
           column: record.column,
           evidence: {
             expression: record.expressionText,
-            signature: record.signatureText,
             polymorphic: record.polymorphic,
           },
           position: record.position,
@@ -2656,14 +2671,6 @@ function captureCallReference(
     polymorphic,
     candidateLocations,
     expressionText: sourceEvidenceText(expression.getText(context.sourceFile)),
-    signatureText: unionCallee
-      ? canonicalSignatureSet(context.project, memberCallSignatures, node)
-      : resolvedSignature
-        ? portableCheckerText(
-          renderCallSignature(context.project, resolvedSignature, node),
-          context.project.root,
-        )
-        : undefined,
   });
 }
 
@@ -2942,7 +2949,13 @@ const signaturePrinter = ts.createPrinter({
 });
 const CHECKER_TEXT_LIMIT = 2_000_000;
 const CHECKER_RENDER_BUDGET = 100_000;
-const RENDER_FLAGS = ts.NodeBuilderFlags.NoTruncation | ts.NodeBuilderFlags.IgnoreErrors;
+// An alias that is not in scope where a type is rendered prints by name, as
+// `typeToString` does by default. Without it the checker expands the alias
+// body inline: a form library's path types grow to megabytes per signature
+// and dominate both extraction time and the checker's retained memory.
+const RENDER_FLAGS = ts.NodeBuilderFlags.NoTruncation | ts.NodeBuilderFlags.IgnoreErrors
+  | ts.NodeBuilderFlags.UseAliasDefinedOutsideCurrentScope;
+const FALLBACK_FORMAT_FLAGS = ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.UseAliasDefinedOutsideCurrentScope;
 let reportedRenderTruncations = 0;
 
 interface RenderOutcome { truncated?: boolean }
@@ -2979,7 +2992,7 @@ function renderType(checker: ts.TypeChecker, type: ts.Type, enclosing: ts.Node):
   recordRenderOutcome(out, enclosing);
   if (!node) {
     recordGraphPhase("compiler.renderFallbacks", 1);
-    return checker.typeToString(type, enclosing, ts.TypeFormatFlags.NoTruncation);
+    return checker.typeToString(type, enclosing, FALLBACK_FORMAT_FLAGS);
   }
   return printCanonical(typePrinter, node, enclosing.getSourceFile());
 }
@@ -2996,7 +3009,7 @@ function renderSignature(checker: ts.TypeChecker, signature: ts.Signature, enclo
   recordRenderOutcome(out, enclosing);
   if (!node) {
     recordGraphPhase("compiler.renderFallbacks", 1);
-    return checker.signatureToString(signature, enclosing, ts.TypeFormatFlags.NoTruncation);
+    return checker.signatureToString(signature, enclosing, FALLBACK_FORMAT_FLAGS);
   }
   return printCanonical(signaturePrinter, node, enclosing.getSourceFile()).replace(/;$/u, "");
 }
@@ -3353,47 +3366,6 @@ function unannotatedConstInitializer(identifier: ts.Identifier, checker: ts.Type
     && (declaration.parent.flags & ts.NodeFlags.Const) !== 0
     ? declaration.initializer
     : undefined;
-}
-
-/** Distinct rendered signatures in canonical order, or undefined for none. */
-function canonicalSignatureSet(
-  project: RuntimeProject,
-  signatures: readonly ts.Signature[],
-  enclosing: ts.Node,
-): string | undefined {
-  const rendered = [...new Set(signatures.map((signature) =>
-    portableCheckerText(renderCallSignature(project, signature, enclosing), project.root)))].sort(compareCodePoints);
-  return rendered.length > 0 ? rendered.join(" | ") : undefined;
-}
-
-/**
- * A call's signature text, rendered once per signature and scope. How the
- * checker names a type in rendered text depends only on the symbols visible
- * from the call, which it looks up through the scopes (`locals`) enclosing it
- * up to the file; calls in the same innermost scope therefore render the same
- * signature identically. Verified exact over every call site of two real
- * repositories (116k calls, 47k repeats), where it saves most of the
- * rendering, which is the largest single cost of capture.
- */
-function renderCallSignature(project: RuntimeProject, signature: ts.Signature, call: ts.Node): string {
-  let scope: ts.Node = call.getSourceFile();
-  for (let current = call.parent; current; current = current.parent) {
-    if ((current as ts.Node & { locals?: unknown }).locals !== undefined) {
-      scope = current;
-      break;
-    }
-  }
-  let texts = project.callSignatureTexts.get(scope);
-  if (!texts) {
-    texts = new Map();
-    project.callSignatureTexts.set(scope, texts);
-  }
-  let text = texts.get(signature);
-  if (text === undefined) {
-    text = renderSignature(project.checker, signature, call);
-    texts.set(signature, text);
-  }
-  return text;
 }
 
 /** The declaration that comes first in the code: portable path, then start, then kind. */
