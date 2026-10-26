@@ -687,7 +687,8 @@ export function runGraphScope(
     const roomAboveFactReserve = (): number => (
       ctx.effectiveMax - ledger.estimatedTokens - summaryTokenReserve - factTokenReserve
     );
-    for (const planned of sourceAdmissions) {
+    const admissionTokens = sourceAdmissions.map((planned) => estimateTokens(planned.record));
+    for (const [admissionIndex, planned] of sourceAdmissions.entries()) {
       const { record, phase } = planned;
       // A large atomic answer may fail the source-share fit while a later
       // compact answer still fits. Continue trying answer admissions, but hold
@@ -708,12 +709,23 @@ export function runGraphScope(
       // A complete answer that only crossed the 75% source-share boundary gets
       // its hard-ledger opportunity immediately. Letting later small answers
       // spend that capacity first starved the earlier, stronger declaration.
+      // It must not take the room of later compact answers that still fit the
+      // share on their own (#305): at some budgets an earlier file's large
+      // second declaration spilled into exactly the space a later file's
+      // compact answer needed, so more budget returned less of the answer.
+      // Held back here, it gets the same opportunity after those answers.
       if (phase === "answer" && planned.atomic && unresolved.length > 0) {
+        const shareLeft = sourceShare - sourceTokens;
+        const laterCompactAnswers = sourceAdmissions.slice(admissionIndex + 1).reduce((total, later, offset) => (
+          later.phase === "answer" && admissionTokens[admissionIndex + 1 + offset]! <= shareLeft
+            ? total + admissionTokens[admissionIndex + 1 + offset]!
+            : total
+        ), 0);
         const stillDeferred: Rec[] = [];
         for (const deferred of unresolved) {
           const spill = admitSourceWithinShare(
             deferred,
-            Math.max(0, roomAboveFactReserve() - flowTokenReserve - factTokensFor(deferred)),
+            Math.max(0, roomAboveFactReserve() - flowTokenReserve - factTokensFor(deferred) - laterCompactAnswers),
             ledger,
             true,
           );
@@ -1112,17 +1124,6 @@ function beginResponse(
   return { ledger, meta, effectiveMax };
 }
 
-/**
- * Reserve once held by the summary's retired `sourceBackedNodes` list (#289).
- * The list is no longer emitted, but Scope's source admission is sensitive to
- * this reserve: at some budgets a larger source share lets an optional body
- * displace a later file's compact answer. The reserve keeps its size until
- * that admission order is fixed on its own (#305).
- */
-const RETIRED_SUMMARY_RESERVE = {
-  sourceBackedNodes: Array(24).fill("method:0123456789abcdef0123456789abcdef"),
-};
-
 function summarySkeleton(suggestions: string[]): Rec {
   return {
     type: "summary", matchedNodes: SIZE_PROBE, returnedNodes: SIZE_PROBE, returnedEdges: SIZE_PROBE,
@@ -1130,10 +1131,9 @@ function summarySkeleton(suggestions: string[]): Rec {
     status: "degraded", evidenceStrength: "moderate",
     coveredTerms: Array(12).fill("identifier-component"),
     returnedFiles: Array(6).fill("path/to/a/representative/source-file.ts"),
-    ...RETIRED_SUMMARY_RESERVE,
     textFallbackFiles: Array(6).fill("path/to/a/representative/source-file.ts"),
     warnings: Array(3).fill("Representative graph health warning."),
-    omittedCounts: Object.fromEntries([...Object.keys(RETIRED_SUMMARY_RESERVE), ...SUMMARY_LIST_KEYS]
+    omittedCounts: Object.fromEntries(SUMMARY_LIST_KEYS
       .map((key) => [key, SIZE_PROBE])),
   };
 }
