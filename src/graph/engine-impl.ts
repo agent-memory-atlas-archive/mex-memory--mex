@@ -17,6 +17,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { lstat as lstatAsync, open as openAsync, realpath as realpathAsync } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isSameResolvedPath, toPosix } from "../paths.js";
@@ -484,8 +485,8 @@ class GraphEngineImpl implements GraphEngine {
     const sourceSpool = new GraphSourceSpool(this.internal.sourceSpoolDirectory);
     let prepared: PreparedCorpus | undefined;
     try {
-      const corpus = timeGraphPhase("sync.discover", () =>
-        discoverSourceFiles(this.rootDir, this.sourceFileAccess, sourceSpool));
+      const corpus = await timeGraphPhaseAsync("sync.discover", () =>
+        discoverSourceFilesConcurrently(this.rootDir, this.sourceFileAccess, sourceSpool));
       if (changedSources.length === 0) {
         const unchanged = unchangedGraphSnapshot(this.rootDir, store, gitBeforeStaging, manifest, corpus.files);
         if (unchanged) {
@@ -959,8 +960,8 @@ async function stageCorpus(
 ): Promise<StagedCorpus> {
   const sourceSpool = prepared?.sourceSpool ?? new GraphSourceSpool(internal.sourceSpoolDirectory);
   try {
-    const { files: discovered, skipped } = prepared?.corpus ?? timeGraphPhase("stage.discover", () =>
-      discoverSourceFiles(root, sourceFileAccess, sourceSpool));
+    const { files: discovered, skipped } = prepared?.corpus ?? await timeGraphPhaseAsync("stage.discover", () =>
+      discoverSourceFilesConcurrently(root, sourceFileAccess, sourceSpool));
     const configSources = timeGraphPhase("stage.config", () => discoverGraphConfigSources(root));
     const stagedConfigHash = configHashForSources(configSources);
     if (stagedConfigHash !== manifest.configHash) {
@@ -2012,6 +2013,95 @@ function inspectChangedSources(
  * so the staged corpus, `verifyPublicationInputs`, `sync`'s corpus comparison
  * and the freshness inspector all agree about which files exist.
  */
+/** Source files read at once by {@link discoverSourceFilesConcurrently}. */
+const DISCOVERY_READ_CONCURRENCY = 16;
+const DISCOVERY_READ_WINDOW = 512;
+
+/**
+ * {@link discoverSourceFiles} with the reads overlapped (#281): the same
+ * files, hashes, spool, skips, failures and limits, in the same order. Each
+ * read makes several file-system calls, and on a large corpus they waited one
+ * after another; status inspection already reads concurrently. Custom file
+ * access (tests, hosts) keeps the sequential path.
+ */
+async function discoverSourceFilesConcurrently(
+  root: string,
+  sourceFileAccess: GraphSourceFileAccess,
+  sourceSpool?: GraphSourceSpool,
+): Promise<DiscoveredCorpus> {
+  if (sourceFileAccess !== NODE_SOURCE_FILE_ACCESS) return discoverSourceFiles(root, sourceFileAccess, sourceSpool);
+  let matches: string[];
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(root);
+    matches = discoverBoundedGraphPaths(GRAPH_SUPPORTED_SOURCE_GLOB, {
+      ...GRAPH_CORPUS_GLOB_OPTIONS,
+      cwd: root,
+      ignore: graphCorpusIgnoreGlobs(root),
+    }, GRAPH_CORPUS_LIMITS.maxSourceFiles).map(toPosix);
+  } catch (error) {
+    throw new GraphSourceStagingError([sourceStagingFailure(".", "discover", error)]);
+  }
+  const canonicalDirectories = new Map<string, string>();
+  type Entry = { relPath: string; canonical?: string; containment?: unknown };
+  const entries: Entry[] = [];
+  for (const relPath of matches) {
+    if (!isSupportedSourceFile(relPath)) continue;
+    try {
+      entries.push({ relPath, canonical: resolveContainedRepoFile(root, canonicalRoot, relPath, canonicalDirectories) });
+    } catch (error) {
+      entries.push({ relPath, containment: error });
+    }
+  }
+  const files: DiscoveredFile[] = [];
+  const skipped: GraphSkippedSourceFile[] = [];
+  const failures: GraphSourceStagingFailure[] = [];
+  let sourceBytes = 0;
+  // A window at a time, so at most one window of sources is held unstaged.
+  for (let start = 0; start < entries.length; start += DISCOVERY_READ_WINDOW) {
+    const window = entries.slice(start, start + DISCOVERY_READ_WINDOW);
+    const reads = new Array<{ file?: Awaited<ReturnType<typeof readStableUtf8FileAsync>>; error?: unknown }>(window.length);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < window.length) {
+        const index = next++;
+        const entry = window[index]!;
+        if (entry.canonical === undefined) continue;
+        try {
+          reads[index] = { file: await readStableUtf8FileAsync(entry.canonical, resolve(root, entry.relPath)) };
+        } catch (error) {
+          reads[index] = { error };
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(DISCOVERY_READ_CONCURRENCY, window.length) }, worker));
+    for (const [index, entry] of window.entries()) {
+      if (entry.canonical === undefined) {
+        failures.push(sourceStagingFailure(entry.relPath, "discover", entry.containment));
+        continue;
+      }
+      const read = reads[index]!;
+      try {
+        if (read.error !== undefined) throw read.error;
+        const file = read.file!;
+        sourceBytes = addGraphCorpusBytes(sourceBytes, Buffer.byteLength(file.source, "utf8"), "source");
+        const contentHash = sha256(file.source);
+        sourceSpool?.stage(entry.relPath, file.source);
+        files.push({ relPath: entry.relPath, contentHash, size: file.size, modifiedAt: file.modifiedAt });
+      } catch (error) {
+        if (isPerFileCorpusLimitError(error)) skipped.push(skippedSourceFile(entry.relPath, error));
+        else {
+          failures.push(sourceStagingFailure(entry.relPath, "read", error));
+          // The corpus limit stops discovery, as the sequential loop does.
+          if (error instanceof GraphCorpusLimitError) throw new GraphSourceStagingError(failures);
+        }
+      }
+    }
+  }
+  if (failures.length > 0) throw new GraphSourceStagingError(failures);
+  return { files, skipped };
+}
+
 function discoverSourceFiles(
   root: string,
   sourceFileAccess: GraphSourceFileAccess,
@@ -2242,6 +2332,52 @@ function readStableUtf8File(
     return { source, size: opened.size, modifiedAt: opened.mtimeMs };
   } finally {
     closeSync(fd);
+  }
+}
+
+/** {@link readStableUtf8File} through asynchronous calls, with the same checks in the same order. */
+async function readStableUtf8FileAsync(
+  canonicalPath: string,
+  sourcePath = canonicalPath,
+  maxBytes = GRAPH_CORPUS_LIMITS.maxSourceFileBytes,
+): Promise<{ source: string; size: number; modifiedAt: number }> {
+  const limitName = "maxSourceFileBytes";
+  const before = await lstatAsync(canonicalPath);
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw sourceContainmentError("Resolved source path is not a stable regular file.");
+  }
+  const remembered = recallSource(canonicalPath, before);
+  if (remembered !== undefined) {
+    if (!Number.isSafeInteger(before.size) || before.size < 0 || before.size > maxBytes) {
+      throw new GraphCorpusLimitError(limitName, Number.isSafeInteger(before.size) ? before.size : undefined);
+    }
+    return { source: remembered, size: before.size, modifiedAt: before.mtimeMs };
+  }
+  const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+  const handle = await openAsync(canonicalPath, constants.O_RDONLY | noFollow);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameFileIdentity(before, opened)) {
+      throw sourceContainmentError("Source path changed before it could be opened.");
+    }
+    if (!Number.isSafeInteger(opened.size) || opened.size < 0 || opened.size > maxBytes) {
+      throw new GraphCorpusLimitError(limitName, Number.isSafeInteger(opened.size) ? opened.size : undefined);
+    }
+    const source = await handle.readFile("utf8");
+    const after = await handle.stat();
+    const resolvedAfter = await realpathAsync(sourcePath);
+    const pathAfter = await lstatAsync(resolvedAfter);
+    if (!sameFileIdentity(opened, after)
+      || !isSameResolvedPath(resolvedAfter, canonicalPath)
+      || !pathAfter.isFile()
+      || pathAfter.isSymbolicLink()
+      || !sameFileIdentity(opened, pathAfter)) {
+      throw sourceContainmentError("Source file changed while it was being read.");
+    }
+    rememberSource(canonicalPath, opened, source);
+    return { source, size: opened.size, modifiedAt: opened.mtimeMs };
+  } finally {
+    await handle.close();
   }
 }
 
