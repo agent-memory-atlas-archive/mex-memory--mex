@@ -461,7 +461,7 @@ class GraphEngineImpl implements GraphEngine {
     );
     try {
       this.assertNoNewParseFailures(staged);
-      const { publication: _publication, ...result } = this.publish(staged, root, gitBeforeStaging, false);
+      const { publication: _publication, ...result } = await this.publish(staged, root, gitBeforeStaging, false);
       return { ...result, durationMs: Date.now() - started };
     } finally {
       staged.sourceSpool.dispose();
@@ -537,7 +537,7 @@ class GraphEngineImpl implements GraphEngine {
         .map((file) => [file.path, file.contentHash]));
       const filesChanged = staged.files.filter((file) => previousFiles.get(file.record.path) !== file.record.contentHash)
         .length + [...previousFiles.keys()].filter((path) => !stagedByPath.has(path)).length;
-      const { publication, ...result } = timeGraphPhase("publish.total", () => this.publish(
+      const { publication, ...result } = await timeGraphPhaseAsync("publish.total", () => this.publish(
         staged,
         this.rootDir,
         gitBeforeStaging,
@@ -600,12 +600,12 @@ class GraphEngineImpl implements GraphEngine {
     })));
   }
 
-  private publish(
+  private async publish(
     staged: StagedCorpus,
     root: string,
     gitBeforeStaging: GraphGitProvenance,
     allowDelta: boolean,
-  ): Omit<BuildResult, "durationMs"> & { publication: GraphPublicationReport } {
+  ): Promise<Omit<BuildResult, "durationMs"> & { publication: GraphPublicationReport }> {
     this.internal.beforePublication?.();
     const store = this.getStore(true);
     const freshNodes = staged.files.flatMap((file) => file.nodes);
@@ -624,7 +624,7 @@ class GraphEngineImpl implements GraphEngine {
     // only after they finish, at the final synchronous boundary before the
     // snapshot is constructed and its publication transaction begins.
     const coverage = timeGraphPhase("publish.coverage", () => captureGraphCoverage(root));
-    const git = timeGraphPhase("publish.verifyInputs", () => verifyPublicationInputs(
+    const git = await timeGraphPhaseAsync("publish.verifyInputs", () => verifyPublicationInputs(
       root,
       staged,
       gitBeforeStaging,
@@ -2521,14 +2521,14 @@ function validateCompilerInputs(
  * manifest verification so a checkout operation during either read is also
  * observed before the transaction begins.
  */
-function verifyPublicationInputs(
+async function verifyPublicationInputs(
   root: string,
   staged: StagedCorpus,
   gitBeforeStaging: GraphGitProvenance,
   sourceFileAccess: GraphSourceFileAccess,
   internal: GraphEngineInternalHooks = {},
-): GraphGitProvenance {
-  const currentFiles = discoverSourceFiles(root, sourceFileAccess).files;
+): Promise<GraphGitProvenance> {
+  const currentFiles = (await discoverSourceFilesConcurrently(root, sourceFileAccess)).files;
   const currentManifest = graphManifest(root);
   const failures: GraphSourceStagingFailure[] = [];
 
