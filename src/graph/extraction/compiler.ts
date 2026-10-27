@@ -22,7 +22,7 @@ import {
 } from "node:path";
 import { getHeapStatistics } from "node:v8";
 import ts from "typescript";
-import { flushGraphPhaseTimings, phaseTimingsEnabled, recordGraphPhase, timeGraphPhase } from "../phase-timing.js";
+import { flushGraphPhaseTimings, phaseTimingsEnabled, recordGraphMemory, recordGraphPhase, timeGraphPhase } from "../phase-timing.js";
 
 // v3 (#240): checker-rendered signatures no longer embed absolute module paths.
 // v4 (#209): checker-rendered unions list their members in one canonical order.
@@ -558,6 +558,7 @@ export function buildTypeScriptExtraction(
   /** Internal construction observer; no source identity crosses this seam. */
   onFileCaptured?: (completed: number) => void,
 ): CompilerExtractionResult {
+  declarationLocationCache = new WeakMap();
   reportedRenderTruncations = 0;
   liveAfterCollection = getHeapStatistics().used_heap_size;
   recordGraphPhase("compiler.truncatedRenders", 0);
@@ -614,38 +615,46 @@ export function buildTypeScriptExtraction(
       return false;
     }
     const stateInputs: Array<{ absolute: string; text: string }> = [];
-    for (const input of recorded.state) {
-      const absolute = isAbsolute(input) ? normalizedAbsolute(input) : absoluteCandidate(root, input);
-      const text = inputs.readFile(absolute);
-      if (text === undefined) return false;
-      stateInputs.push({ absolute, text });
-    }
-    if (projectStateDigest(root, stateInputs) !== incremental.projectStates[project.id]) return false;
+    const complete = timeGraphPhase("compiler.reuseProject.readState", () => {
+      for (const input of recorded.state) {
+        const absolute = isAbsolute(input) ? normalizedAbsolute(input) : absoluteCandidate(root, input);
+        const text = inputs.readFile(absolute);
+        if (text === undefined) return false;
+        stateInputs.push({ absolute, text });
+      }
+      return true;
+    });
+    if (!complete || timeGraphPhase("compiler.reuseProject.digest", () => projectStateDigest(root, stateInputs))
+      !== incremental.projectStates[project.id]) return false;
     // Replay the reads, recording them again: a file deleted since is no
     // longer read. Manifests are the program's own and carry over.
     inputs.trackProjectReads();
-    for (const path of recorded.observed) inputs.readFile(absoluteCandidate(root, path));
+    timeGraphPhase("compiler.reuseProject.replay", () => {
+      for (const path of recorded.observed) inputs.readFile(absoluteCandidate(root, path));
+    });
     const observed = new Set(inputs.takeProjectReads().filter((path) => !PACKAGE_JSON.test(path)));
     for (const path of recorded.observed) if (PACKAGE_JSON.test(path)) observed.add(path);
     projectInputs[project.id] = { observed: [...observed].sort(compareCodePoints), state: recorded.state };
     projectStates[project.id] = incremental.projectStates[project.id]!;
-    for (const path of owned) {
-      const absoluteFile = absoluteCandidate(root, path);
-      const previous = incremental.previous.get(path)!;
-      const captured = restoreCapture(previous, rootPrefix);
-      claimed.add(absoluteFile);
-      dependenciesByFile.set(absoluteFile, {
-        dependencies: previous.dependencies,
-        failedLookups: previous.failedLookups,
-        globalScope: previous.globalScope,
-      });
-      for (const [location, id] of captured.locations) locationIds.set(location, id);
-      for (const node of captured.nodes) nodeById.set(node.id, node);
-      capturedByFile.set(absoluteFile, captured);
-      reusedCaptures.set(absoluteFile, previous);
-      reusedFiles.push(path);
-      onFileCaptured?.(capturedByFile.size);
-    }
+    timeGraphPhase("compiler.reuseProject.restore", () => {
+      for (const path of owned) {
+        const absoluteFile = absoluteCandidate(root, path);
+        const previous = incremental.previous.get(path)!;
+        const captured = restoreCapture(previous, rootPrefix);
+        claimed.add(absoluteFile);
+        dependenciesByFile.set(absoluteFile, {
+          dependencies: previous.dependencies,
+          failedLookups: previous.failedLookups,
+          globalScope: previous.globalScope,
+        });
+        for (const [location, id] of captured.locations) locationIds.set(location, id);
+        for (const node of captured.nodes) nodeById.set(node.id, node);
+        capturedByFile.set(absoluteFile, captured);
+        reusedCaptures.set(absoluteFile, previous);
+        reusedFiles.push(path);
+        onFileCaptured?.(capturedByFile.size);
+      }
+    });
     return true;
   };
 
@@ -831,6 +840,11 @@ export function buildTypeScriptExtraction(
         locations: contextLocations.get(context)!,
         resolvedSpecifiers,
       });
+      context.drafts.length = 0;
+      context.declarationDrafts.clear();
+      context.symbolDrafts.clear();
+      context.fileDraft = undefined;
+      contextLocations.delete(context);
       recaptured++;
       onFileCaptured?.(capturedByFile.size);
     }
@@ -857,7 +871,7 @@ export function buildTypeScriptExtraction(
     // Later projects cannot contribute facts once every candidate has an owner.
     // Avoid constructing another program and checker for those empty projects.
     if (candidates.length > 0 && claimed.size === candidates.length) break;
-    if (reuseUnchangedProject(project)) continue;
+    if (timeGraphPhase("compiler.reuseProject", () => reuseUnchangedProject(project))) continue;
     // Root only what this project can still own: candidates no more specific
     // project claimed, plus declaration files for ambient types. Files those
     // roots import still load. A broad config (a repository-root tsconfig
@@ -877,6 +891,7 @@ export function buildTypeScriptExtraction(
     let program: ts.Program | undefined;
     inputs.trackProjectReads();
     const programStarted = performance.now();
+    recordGraphMemory("compiler.beforeProgram");
     try {
       program = createProgram({
         rootNames,
@@ -905,6 +920,7 @@ export function buildTypeScriptExtraction(
       try { return program!.getSourceFile(file) !== undefined; }
       catch { return false; }
     });
+    recordGraphMemory("compiler.afterProgram");
     for (const file of owned) claimed.add(file);
     if (unchangedProjects?.enabled) {
       // A project that owns other files than before can move ownership for
@@ -915,6 +931,7 @@ export function buildTypeScriptExtraction(
     }
     try {
       timeGraphPhase("compiler.capture", () => processProject(project, program!, owned));
+      recordGraphMemory("compiler.afterCapture");
       // Manifests come from the program itself; a tracked manifest read is
       // whichever program happened to read it first.
       const observed = new Set(inputs.takeProjectReads().filter((path) => !PACKAGE_JSON.test(path)));
@@ -927,8 +944,10 @@ export function buildTypeScriptExtraction(
       // V8 can keep the loop's captured context on the stack through the
       // inferred and finishing passes. Scope exit alone does not release it.
       program = undefined;
+      declarationLocationCache = new WeakMap();
       inputs.releaseProjectSources();
       collectReleasedProgram();
+      recordGraphMemory("compiler.afterRelease");
     }
   }
 
@@ -974,7 +993,9 @@ export function buildTypeScriptExtraction(
       // Poison among the uncovered roots: leave them all to tree-sitter.
     } finally {
       inferredProgram = undefined;
+      declarationLocationCache = new WeakMap();
       inputs.releaseProjectSources();
+      collectReleasedProgram();
     }
   }
 
@@ -1021,6 +1042,7 @@ export function buildTypeScriptExtraction(
       importBindings,
       references: finishReferences(captured, importBindings, locationIds, nodeById, fileDraftIdByPath),
     } satisfies CompilerFileExtraction);
+    capturedByFile.delete(absoluteFile);
   }
 
   recordGraphPhase("compiler.finish", performance.now() - finishStarted);
@@ -2117,7 +2139,7 @@ function collectReleasedProgram(): void {
   liveAfterCollection = getHeapStatistics().used_heap_size;
 }
 
-const PROGRAM_COLLECTION_STEP_BYTES = 1024 * 1024 * 1024;
+const PROGRAM_COLLECTION_STEP_BYTES = 512 * 1024 * 1024;
 let liveAfterCollection = 0;
 
 /** TypeScript's declaration file names, including `.d.<extension>.ts`. */
@@ -3111,6 +3133,7 @@ function diagnosticRanges(source: string, diagnostics: readonly ts.Diagnostic[])
 }
 
 function intersectsRanges(node: ts.Node, ranges: readonly ErrorRange[]): boolean {
+  if (ranges.length === 0) return false;
   const start = node.getStart(node.getSourceFile(), false);
   const end = node.getEnd();
   return ranges.some((range) => range.start < end && range.end > start);
@@ -3118,6 +3141,7 @@ function intersectsRanges(node: ts.Node, ranges: readonly ErrorRange[]): boolean
 
 function referenceSyntaxIsTrusted(node: ts.Node, context: FileContext): boolean {
   if (intersectsRanges(node, context.errorRanges)) return false;
+  if (context.excludedDeclarationRanges.length === 0) return true;
   const start = node.getStart(context.sourceFile, false);
   const end = node.getEnd();
   return !context.excludedDeclarationRanges.some((range) => range.start <= start && range.end >= end);
@@ -3319,8 +3343,16 @@ function symbolForDeclaration(declaration: ts.Declaration, checker: ts.TypeCheck
   return undefined;
 }
 
+// Captures can share these strings without keeping their syntax trees alive.
+let declarationLocationCache = new WeakMap<ts.Node, string>();
+
 function declarationLocation(node: ts.Node): string {
-  return `${normalizedAbsolute(node.getSourceFile().fileName)}:${node.getStart(node.getSourceFile(), false)}:${node.kind}`;
+  const cached = declarationLocationCache.get(node);
+  if (cached !== undefined) return cached;
+  const source = node.getSourceFile();
+  const location = `${normalizedAbsolute(source.fileName)}:${node.getStart(source, false)}:${node.kind}`;
+  declarationLocationCache.set(node, location);
+  return location;
 }
 
 function compatibleDeclaration(kind: CompilerNodeKind, declaration: ts.Declaration): boolean {
@@ -3744,7 +3776,7 @@ function normalizeRelative(value: string): string {
 }
 
 function normalizedAbsolute(value: string): string {
-  return resolve(value).split(sep).join("/");
+  return resolve(value).replaceAll(sep, "/");
 }
 
 function absoluteCandidate(root: string, file: string): string {

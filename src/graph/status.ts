@@ -26,6 +26,7 @@ import type { Diagnostic, RepoState } from "../team/contracts/shared.js";
 import { DB_SCHEMA_VERSION, detectGraphSchemaLineage } from "./db/database.js";
 import { openSqlite, type SqliteDatabase } from "./db/sqlite.js";
 import { holdsAuditedBytes } from "./audit-record.js";
+import { timeGraphPhase, timeGraphPhaseAsync } from "./phase-timing.js";
 import { recallSource, rememberSource } from "./source-memo.js";
 import { BANDS, K, MIN_TOKENS } from "./config.js";
 import {
@@ -532,19 +533,19 @@ async function inspectGraphStatusAttempt(
   }
   const database = contained.database;
   const diagnostics: Diagnostic[] = [];
-  const repo = await inspectRepoState(projectRoot, observedAt);
+  const repo = await timeGraphPhaseAsync("inspect.repo", () => inspectRepoState(projectRoot, observedAt));
   const currentRepo = repo.state;
   diagnostics.push(...repo.diagnostics);
-  const live = await inspectLiveSources(
+  const live = await timeGraphPhaseAsync("inspect.sources", () => inspectLiveSources(
     projectRoot,
     database.projectRootRealPath,
     maxChangedPaths,
     context.options.internal?.liveSourceReadConcurrency ?? LIVE_SOURCE_READ_CONCURRENCY,
     (path) => context.options.internal?.afterSourceRead?.(path, "initial"),
     context.options.sourceScope,
-  );
+  ));
   diagnostics.push(...live.diagnostics);
-  const manifest = inspectCurrentManifest(projectRoot, diagnostics);
+  const manifest = timeGraphPhase("inspect.manifest", () => inspectCurrentManifest(projectRoot, diagnostics));
   let buildPrerequisitesComplete = repo.complete && live.complete && manifest !== null;
 
   let fileStat: ReturnType<typeof statSync>;
@@ -765,7 +766,7 @@ async function inspectGraphStatusAttempt(
     }
 
     try {
-      if (detectGraphSchemaLineage(db, schemaVersion) !== "v4") {
+      if (timeGraphPhase("inspect.lineage", () => detectGraphSchemaLineage(db!, schemaVersion)) !== "v4") {
         throw new Error("unexpected current schema lineage");
       }
     } catch {
@@ -786,7 +787,7 @@ async function inspectGraphStatusAttempt(
       }));
     }
 
-    const schemaFailures = inspectRequiredSchema(db);
+    const schemaFailures = timeGraphPhase("inspect.schema", () => inspectRequiredSchema(db!));
     if (schemaFailures.length > 0) {
       diagnostics.push({
         code: "GRAPH_INDEX_SCHEMA_INVALID",
@@ -810,12 +811,12 @@ async function inspectGraphStatusAttempt(
     // observation comparison regardless. Any doubt runs the full audit.
     // A file holding exactly the bytes of a database that already passed the
     // full audit cannot fail it (issue #209); proven by SHA-256, not by stat.
-    const structureAudited = isAuditedDatabase(
+    const structureAudited = timeGraphPhase("inspect.auditIdentity", () => isAuditedDatabase(
       context.options.auditedDatabase,
       database.canonicalPath,
       databaseFileIdentity(fileStat),
-    ) || holdsAuditedBytes(database.canonicalPath, fileStat!);
-    const integrity = structureAudited ? [] : quickCheck(db);
+    ) || holdsAuditedBytes(database.canonicalPath, fileStat!));
+    const integrity = structureAudited ? [] : timeGraphPhase("inspect.quickCheck", () => quickCheck(db!));
     if (integrity.length > 0) {
       diagnostics.push({
         code: "GRAPH_INDEX_CORRUPT",
@@ -834,11 +835,11 @@ async function inspectGraphStatusAttempt(
         }));
     }
 
-    const coreInvariantFailures = structureAudited ? [] : inspectCoreInvariants(db, {
+    const coreInvariantFailures = structureAudited ? [] : timeGraphPhase("inspect.invariants", () => inspectCoreInvariants(db!, {
       fingerprints: context.options.structuralAudit !== "graph",
       bandHashMemo: context.options.bandHashMemo,
       ...(context.options.fingerprintScope ? { fingerprintScope: context.options.fingerprintScope } : {}),
-    });
+    }));
     if (coreInvariantFailures.length > 0) {
       diagnostics.push({
         code: "GRAPH_INDEX_INVARIANT_FAILED",
@@ -904,18 +905,18 @@ async function inspectGraphStatusAttempt(
     }
 
     const semantic = snapshot
-      ? inspectSemanticInputs(
+      ? timeGraphPhase("inspect.semanticInputs", () => inspectSemanticInputs(
           projectRoot,
           database.projectRootRealPath,
           snapshot.semanticInputs,
           maxChangedPaths,
           (path) => context.options.internal?.afterSemanticInputRead?.(path, "initial"),
-        )
+        ))
       : emptySemanticInputs();
     diagnostics.push(...semantic.diagnostics);
     buildPrerequisitesComplete = buildPrerequisitesComplete && semantic.complete;
 
-    const files = readFiles(db);
+    const files = timeGraphPhase("inspect.files", () => readFiles(db!));
     if (context.options.sourceScope) {
       retainUnscopedSources(live, files.map(file => [file.path, file.content_hash]), context.options.sourceScope);
     }
@@ -1149,7 +1150,8 @@ async function inspectGraphStatusAttempt(
       database,
       databaseIdentity: databaseFileIdentity(fileStat),
     };
-    const validation = await validateFreshObservation(context, observation, degradations);
+    const validation = await timeGraphPhaseAsync("inspect.validateObservation", () =>
+      validateFreshObservation(context, observation, degradations));
     if (validation.stable) {
       observationRechecks.set(validation.freshObservation!, async () => {
         // The initial pass and its independent validation already established
@@ -1529,27 +1531,29 @@ async function validateFreshObservation(
     return unstableObservation("degraded", ["database path"]);
   }
 
-  const repo = await inspectRepoState(context.projectRoot, context.observedAt);
-  const live = await inspectLiveSources(
+  const repo = await timeGraphPhaseAsync("inspect.validation.repo", () =>
+    inspectRepoState(context.projectRoot, context.observedAt));
+  const live = await timeGraphPhaseAsync("inspect.validation.sources", () => inspectLiveSources(
     context.projectRoot,
     contained.database.projectRootRealPath,
     context.maxChangedPaths,
     context.options.internal?.liveSourceReadConcurrency ?? LIVE_SOURCE_READ_CONCURRENCY,
     (path) => context.options.internal?.afterSourceRead?.(path, "validation"),
     context.options.sourceScope,
-  );
+  ));
   if (context.options.sourceScope) {
     retainUnscopedSources(live, before.live.hashes, context.options.sourceScope);
   }
-  const semantic = inspectSemanticInputs(
+  const semantic = timeGraphPhase("inspect.validation.semanticInputs", () => inspectSemanticInputs(
     context.projectRoot,
     contained.database.projectRootRealPath,
     before.semanticInputs,
     context.maxChangedPaths,
     (path) => context.options.internal?.afterSemanticInputRead?.(path, "validation"),
-  );
+  ));
   const manifestDiagnostics: Diagnostic[] = [];
-  const manifest = inspectCurrentManifest(context.projectRoot, manifestDiagnostics);
+  const manifest = timeGraphPhase("inspect.validation.manifest", () =>
+    inspectCurrentManifest(context.projectRoot, manifestDiagnostics));
   if (!repo.complete || !live.complete || !semantic.complete || manifest === null) {
     const status = !repo.complete ? "degraded" : "stale";
     return {
@@ -1579,7 +1583,8 @@ async function validateFreshObservation(
   let snapshotRaw: string;
   let identity: string;
   try {
-    const snapshotIdentity = readSnapshotIdentity(contained.database.canonicalPath);
+    const snapshotIdentity = timeGraphPhase("inspect.validation.snapshot", () =>
+      readSnapshotIdentity(contained.database.canonicalPath));
     snapshotRaw = snapshotIdentity.snapshotRaw;
     identity = snapshotIdentity.databaseIdentity;
   } catch {

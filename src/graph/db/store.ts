@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import type { EdgeKind, GraphEdge, GraphNode, Language, NodeKind, ReferenceKind } from "../types.js";
 import { identifierComponents, isLowValueGraphPath, planGraphQuery } from "../retrieval/query.js";
 import type { SqliteDatabase, SqliteStatement } from "./sqlite.js";
+import { timeGraphPhase } from "../phase-timing.js";
 
 /** An unresolved reference row: a name a node points at, bound after indexing. */
 export interface UnresolvedRefRecord {
@@ -673,19 +674,23 @@ export class GraphStore {
 
   /** Clear only derived graph/index rows; authored grounding snapshots survive. */
   clearDerivedGraph(): void {
-    this.db.exec("DELETE FROM source_chunks_fts");
-    this.db.exec("DELETE FROM source_chunks");
-    this.db.exec("DELETE FROM import_bindings");
-    this.db.exec("DELETE FROM node_aliases");
-    // Clear fingerprint dependents in bulk before deleting nodes. Relying on
-    // the node FK cascade here makes SQLite scan the large LSH table once per
-    // node because its lookup index is band-oriented rather than node-oriented.
-    this.db.exec("DELETE FROM lsh_buckets");
-    this.db.exec("DELETE FROM node_fingerprints");
-    this.db.exec("DELETE FROM nodes");
-    this.db.exec("DELETE FROM files");
-    this.db.exec("DELETE FROM file_row_digests");
-    this.db.exec("DELETE FROM file_extraction_cache");
+    timeGraphPhase("publish.clear.dependents", () => {
+      this.db.exec("DELETE FROM source_chunks_fts");
+      this.db.exec("DELETE FROM source_chunks");
+      this.db.exec("DELETE FROM import_bindings");
+      this.db.exec("DELETE FROM node_aliases");
+      // Clear fingerprint dependents in bulk before deleting nodes. Relying on
+      // the node FK cascade here makes SQLite scan the large LSH table once per
+      // node because its lookup index is band-oriented rather than node-oriented.
+      this.db.exec("DELETE FROM lsh_buckets");
+      this.db.exec("DELETE FROM node_fingerprints");
+    });
+    timeGraphPhase("publish.clear.nodes", () => this.db.exec("DELETE FROM nodes"));
+    timeGraphPhase("publish.clear.filesAndCaches", () => {
+      this.db.exec("DELETE FROM files");
+      this.db.exec("DELETE FROM file_row_digests");
+      this.db.exec("DELETE FROM file_extraction_cache");
+    });
   }
 
   // --- Incremental publication (issue #209) -----------------------------------

@@ -107,7 +107,7 @@ import {
   type GraphSnapshotSemanticInput,
 } from "./snapshot.js";
 import { getCallees, getCallers, getIncoming, getOutgoing } from "./traversal/traversal.js";
-import { recordGraphPhase, timeGraphPhase, timeGraphPhaseAsync } from "./phase-timing.js";
+import { recordGraphMemory, recordGraphPhase, timeGraphPhase, timeGraphPhaseAsync } from "./phase-timing.js";
 import { recallSource, rememberSource, reserveHeldBytes } from "./source-memo.js";
 import type { GraphEdge, GraphNode, Language, ReferenceKind } from "./types.js";
 
@@ -435,11 +435,11 @@ class GraphEngineImpl implements GraphEngine {
   private getStore(allowRebuild = false): GraphStore {
     if (!this.store) {
       this.internal.beforeDatabaseOpen?.();
-      this.db = openGraphDatabase(this.dbPath, {
+      this.db = timeGraphPhase("engine.openDatabase", () => openGraphDatabase(this.dbPath, {
         allowRebuild,
         readOnly: this.readOnly,
         immutable: this.immutable,
-      });
+      }));
       this.store = new GraphStore(this.db);
     }
     return this.store;
@@ -460,11 +460,11 @@ class GraphEngineImpl implements GraphEngine {
       { reason: "a rebuild extracts in full" },
     );
     try {
-      this.assertNoNewParseFailures(staged);
+      timeGraphPhase("stage.parseRegressionCheck", () => this.assertNoNewParseFailures(staged));
       const { publication: _publication, ...result } = await this.publish(staged, root, gitBeforeStaging, false);
       return { ...result, durationMs: Date.now() - started };
     } finally {
-      staged.sourceSpool.dispose();
+      timeGraphPhase("stage.disposeSpool", () => staged.sourceSpool.dispose());
     }
   }
 
@@ -532,7 +532,7 @@ class GraphEngineImpl implements GraphEngine {
           message: "The changed source still exists but was absent from the staged corpus.",
         })));
       }
-      this.assertNoNewParseFailures(staged);
+      timeGraphPhase("stage.parseRegressionCheck", () => this.assertNoNewParseFailures(staged));
       const previousFiles = new Map(this.getStore(true).getAllFileRecords()
         .map((file) => [file.path, file.contentHash]));
       const filesChanged = staged.files.filter((file) => previousFiles.get(file.record.path) !== file.record.contentHash)
@@ -555,7 +555,7 @@ class GraphEngineImpl implements GraphEngine {
         durationMs: Date.now() - started,
       };
     } finally {
-      staged.sourceSpool.dispose();
+      timeGraphPhase("stage.disposeSpool", () => staged.sourceSpool.dispose());
     }
   }
 
@@ -613,6 +613,7 @@ class GraphEngineImpl implements GraphEngine {
     // owned rows changed. Any reason it cannot is a full publication, which
     // also records the digests the next refresh compares against.
     const grouped = timeGraphPhase("publish.rowGroups", () => groupRowsByFile(staged.files, staged.fingerprints));
+    recordGraphMemory("publish.afterRowGroups");
     const planned = !allowDelta ? { reason: "a full publication was requested" }
       : "reason" in grouped ? grouped
       : timeGraphPhase("publish.deltaPlan", () => planRowDelta(store, this.db!, grouped));
@@ -661,6 +662,7 @@ class GraphEngineImpl implements GraphEngine {
     });
     const serializedSnapshot = serializeGraphSnapshot(snapshot);
 
+    recordGraphMemory("publish.beforeTransaction");
     store.transaction(() => {
       if (delta) {
         const stagedByPath = new Map(staged.files.map((file) => [file.record.path, file]));
@@ -714,6 +716,7 @@ class GraphEngineImpl implements GraphEngine {
       else store.setMetadata(INCREMENTAL_STATE_METADATA_KEY, incrementalStateMarker(serializedSnapshot));
       markGraphReady(this.db!, staged.manifestHash);
     });
+    recordGraphMemory("publish.afterTransaction");
 
     return {
       filesIndexed: staged.files.length,
@@ -977,20 +980,22 @@ async function stageCorpus(
     const compilerPaths = compilerFiles.map((file) => file.relPath);
     const compilerInputs: CompilerStagedInput[] = [...configSources.entries()]
       .map(([filePath, source]) => ({ filePath, source }));
-    let compilerSourceBytes = 0;
-    for (const file of compilerFiles) {
-      const source = sourceSpool.read(file);
-      try {
-        compilerSourceBytes = addGraphCompilerSourceBytes(
-          compilerSourceBytes,
-          Buffer.byteLength(source, "utf8"),
-        );
-      } catch (error) {
-        throw new GraphSourceStagingError([sourceStagingFailure(file.relPath, "read", error)]);
+    timeGraphPhase("stage.compilerInputs", () => {
+      let compilerSourceBytes = 0;
+      for (const file of compilerFiles) {
+        const source = sourceSpool.read(file);
+        try {
+          compilerSourceBytes = addGraphCompilerSourceBytes(
+            compilerSourceBytes,
+            Buffer.byteLength(source, "utf8"),
+          );
+        } catch (error) {
+          throw new GraphSourceStagingError([sourceStagingFailure(file.relPath, "read", error)]);
+        }
+        compilerInputs.push({ filePath: file.relPath, source });
       }
-      compilerInputs.push({ filePath: file.relPath, source });
-    }
-    compilerInputs.sort((left, right) => compareCodePoints(left.filePath, right.filePath));
+      compilerInputs.sort((left, right) => compareCodePoints(left.filePath, right.filePath));
+    });
     internal.afterSemanticInputsStaged?.();
     const reportParsed = (completed: number): void => internal.onBuildProgress?.({
       phase: "parse",
@@ -1118,6 +1123,13 @@ async function stageCorpus(
       }
     });
     compiler.captures.length = 0;
+    if (!("reason" in plan)) {
+      plan.captures.clear();
+      plan.affected.clear();
+      plan.gated.clear();
+      plan.modified.clear();
+      plan.importers.clear();
+    }
     const cachedTrees = "reason" in plan ? undefined : plan.trees;
 
     let parsed = compiler.files.length;
@@ -1149,6 +1161,14 @@ async function stageCorpus(
     // has been copied. Per-node compiler spans survive only until fingerprinting.
     compiler.files.length = 0;
     compiler.projects.length = 0;
+    if (!("reason" in plan)) plan.trees.clear();
+    storedExtraction.clear();
+    const gc = (globalThis as { gc?: () => void }).gc;
+    if (gc && process.memoryUsage().heapUsed >= 512 * 1024 * 1024) {
+      recordGraphMemory("stage.beforeCollection");
+      timeGraphPhase("stage.collectReleasedCompiler", gc);
+      recordGraphMemory("stage.afterCollection");
+    }
 
     internal.onBuildProgress?.({ phase: "resolve" });
     timeGraphPhase("stage.resolve", () =>
@@ -1160,6 +1180,7 @@ async function stageCorpus(
       sourceSpool,
       "reason" in reuse ? undefined : reuse,
     ));
+    recordGraphMemory("stage.afterFingerprints");
     const coveredPaths = new Set([...discovered.map((file) => file.relPath), ...configSources.keys()]);
     const semanticInputs = compiler.semanticInputs.filter((input) => !coveredPaths.has(input.filePath));
     if (semanticInputs.length > GRAPH_SNAPSHOT_MAX_SEMANTIC_INPUTS) {

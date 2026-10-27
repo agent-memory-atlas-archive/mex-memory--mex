@@ -26,6 +26,14 @@ const PHASE_TIMINGS_ENV = "MEX_GRAPH_PHASE_TIMINGS";
 const DEFAULT_TIMINGS_FILE = join(".mex", "local", "graph-phase-timings.jsonl");
 
 const totals = new Map<string, number>();
+const memory: Array<{ phase: string; rss: number; heapUsed: number; external: number }> = [];
+
+/** Bounded, opt-in worker memory samples; labels never contain source paths. */
+export function recordGraphMemory(phase: string): void {
+  if (!phaseTimingsEnabled() || memory.length >= 1024) return;
+  const { rss, heapUsed, external } = process.memoryUsage();
+  memory.push({ phase, rss, heapUsed, external });
+}
 
 /** Off (null), the default sink, or the operator's path, taken as written. */
 function phaseTimingsTarget(value: string | undefined): { default: true } | { path: string } | null {
@@ -104,6 +112,7 @@ export function flushGraphPhaseTimings(label: string, projectRoot?: string): voi
   const target = phaseTimingsTarget(process.env[PHASE_TIMINGS_ENV]);
   if (target === null) {
     totals.clear();
+    memory.length = 0;
     return;
   }
   const phases = Object.fromEntries([...totals.entries()].map(([phase, ms]) => [phase, Math.round(ms * 10) / 10]));
@@ -116,8 +125,9 @@ export function flushGraphPhaseTimings(label: string, projectRoot?: string): voi
     if ("default" in target) {
       mkdirSync(dirname(file), { recursive: true });
     }
-    appendFileSync(file, `${JSON.stringify({ label, pid: process.pid, phases })}\n`);
+    appendFileSync(file, `${JSON.stringify({ label, pid: process.pid, phases, memory })}\n`);
   } catch {
     // Diagnostics must never change the outcome of a maintenance operation.
   }
+  memory.length = 0;
 }
