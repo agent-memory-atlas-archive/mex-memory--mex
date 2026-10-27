@@ -19,6 +19,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Setup end-to-end coverage uses deterministic fake agents for both supported launchers, phase interruption, fresh clones, concurrency and the browser flow; the optional smoke workflow needs no paid sessions or API secrets (#292).
+
 - Setup audits population for project patterns, code-linked facts, structural links, warning by name when knowledge is thin. Code-fact checks apply only when the graph indexed supported sources. Authorship requires project content, including for older templates and formatting-only edits. Finalization fills leftover date and project-title markers (in metadata and ordinary sentences) and names each changed file, preserving code, comments and text that discusses the placeholders. Older authored scaffolds and never-dispatched legacy queues finish without an agent or a new population plan; interrupted work keeps its recorded progress (#283, #164).
 
 - When `mex setup` pauses for population without a terminal, as when an agent runs it, the output now addresses that agent: run `mex setup next --start` for the one-paste handoff, or follow a full population prompt in this session and rerun `mex setup` to finalize. Do not commit until setup reports complete. A person running `mex setup --yes` in a terminal still sees the previous wording (#285).
