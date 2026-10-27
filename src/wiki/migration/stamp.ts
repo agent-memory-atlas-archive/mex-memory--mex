@@ -91,6 +91,9 @@ export function stampTypeOf(file: InventoryFile, scope: StampOptions["scope"]): 
   const entities = file.parsed.entities;
   if (entities.some((entry) => entry.metadataKind === "frontmatter")) return null;
   if (entities.some((entry) => SPEC_FAMILY.includes(entry.entity.type))) return null;
+  // Even a partially populated log must adopt its remaining decisions before
+  // its container. Facts alone do not mean those prose entries were adopted.
+  if (path === "context/decisions.md") return null;
 
   const role = roleFor(path);
   const declared = file.parsed.legacy.type;

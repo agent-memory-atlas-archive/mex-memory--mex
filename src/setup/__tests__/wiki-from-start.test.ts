@@ -49,6 +49,8 @@ describe("a Wiki from the start (#286)", () => {
       "**Reasoning:** One file, no server, rebuilt from Markdown at any time.",
       "",
     ].join("\n"));
+    // A fact in the log must not make finalize skip its authored decisions.
+    await createFact(mexDir, "context/decisions.md", "decision_fact", "The log retains decisions");
 
     const warnings: string[] = [];
     const result = await finalizeSetupWiki({ projectRoot, scaffoldRoot: mexDir, onWarning: (message) => warnings.push(message) });
@@ -73,6 +75,7 @@ describe("a Wiki from the start (#286)", () => {
     const decision = entities.find((entity) => entity.title === "Keep the index in SQLite");
     expect(decision?.type).toBe("decision");
     expect(refinesOf("Keep the index in SQLite")).toEqual([decisionsId]);
+    expect(refinesOf("The log retains decisions")).toEqual([decisionsId]);
     // The architecture template's edge to the decision log now resolves.
     const architecture = entities.find((entity) => entity.id === architectureId);
     expect(architecture?.relations.map((relation) => relation.target)).toContain(decisionsId);
@@ -116,6 +119,7 @@ describe("a Wiki from the start (#286)", () => {
       .find((entry) => entry.entity.title === "Workers drain the queue");
     expect(fact?.entity.relations).toEqual([expect.objectContaining({ type: "refines", target: fileId })]);
   });
+
 });
 
 function placedScaffold(): { projectRoot: string; mexDir: string } {

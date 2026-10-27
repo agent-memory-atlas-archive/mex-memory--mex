@@ -1,16 +1,18 @@
+import { existsSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { stdin, stdout } from "node:process";
 import { AI_TOOLS, type AiTool } from "../types.js";
 import { BACKGROUND_AGENT_CLIS, isBackgroundAgentTool } from "../agent-command.js";
-import { loadConfiguredAiTools } from "../config.js";
+import { loadConfiguredAiTools, loadConfiguredSetupMode } from "../config.js";
 import { isCliAvailable } from "../cli-tools.js";
 import {
-  ensureToolAnchors, findSetupProjectRoot, installSetupAgentAssets, isScaffoldPopulated,
+  ensureToolAnchors, findSetupProjectRoot, installSetupAgentAssets, isScaffoldPopulated, setupCommitCheckpointCommands,
   type SetupRunOptions, type SetupRunResult,
 } from "./index.js";
 import {
   createSetupScaffold, requireSetupGitRepository, resolveSetupMode, setupTemplatesDirectory, throwIfSetupAborted,
 } from "./phases.js";
+import { assessSetupHealth, describeSetupHealth } from "./health.js";
 import { runHeadlessSetup, type HeadlessSetupResult } from "./headless.js";
 import { SetupError } from "./errors.js";
 import { classifySetupAgentAssetsError } from "./agent-errors.js";
@@ -20,8 +22,12 @@ import type { TerminalSetupAction, TerminalSetupView } from "./terminal-ui.js";
 import { appendTerminalSetupEvent } from "./terminal-events.js";
 import { SETUP_HANDOFF_PROMPT, describeUnfinishedSetup } from "./unfinished.js";
 import { waitForTerminalReturn } from "./terminal-return.js";
+import { assertSetupAvailable } from "./setup-lock.js";
 
 const CONTINUE = "Run `mex setup` to continue. Existing authored files are preserved.";
+const AGENT_CONTINUE = "\nYou are the population agent. Follow the prompt below in this session.\n"
+  + "When done, run `mex setup` again to finalize. Existing authored files are preserved.\n"
+  + "Do not commit until setup reports complete (`mex setup` exits with code 0).";
 
 /** The terminal owns presentation and interaction; all writes use the shared setup engine. */
 export async function runTerminalSetup(options: SetupRunOptions): Promise<SetupRunResult> {
@@ -32,7 +38,29 @@ export async function runTerminalSetup(options: SetupRunOptions): Promise<SetupR
   if (options.dryRun) return previewSetup(projectRoot, mode, selectedTools, options.tools !== undefined);
   // Before the tool picker: a choice the engine would then refuse is wasted (#287).
   requireSetupGitRepository(projectRoot, mode);
-  const interactive = Boolean(stdin.isTTY && stdout.isTTY && !options.yes && !process.env.CI && process.env.TERM !== "dumb");
+  assertSetupAvailable(mexDir);
+  const hasTerminal = Boolean(stdin.isTTY && stdout.isTTY);
+  const interactive = hasTerminal && !options.yes && !process.env.CI && process.env.TERM !== "dumb";
+  // Status first (#284): a rerun over an existing scaffold reports instead of
+  // redoing work, unless --force asks for the full flow or the person asks for
+  // a different mode or tool set, which only the flow can apply.
+  const health = !options.force && existsSync(resolve(mexDir, "ROUTER.md"))
+    && mode === loadConfiguredSetupMode(mexDir)
+    && (options.tools === undefined || sameTools(options.tools, loadConfiguredAiTools(mexDir)))
+    ? await assessSetupHealth(projectRoot)
+    : undefined;
+  if (health?.healthy) {
+    console.log(describeSetupHealth(health));
+    return { outcome: "complete", exitCode: 0, message: health.summary };
+  }
+  if (health?.needsCommitOnly && !interactive) {
+    const message = "MEX is prepared here but the setup is not committed yet. Run `mex setup --browser` to review and commit it.";
+    console.log([message, ...health.notes].join("\n"));
+    return { outcome: "complete", exitCode: 0, message };
+  }
+  if (health && health.missing.length > 0 && !interactive) {
+    console.log(`Setup will finish what is missing:\n${health.missing.map(item => `- ${item}`).join("\n")}`);
+  }
   const abort = new AbortController();
   let cancelCode = 130;
   let cancellationDetail = "";
@@ -54,7 +82,8 @@ export async function runTerminalSetup(options: SetupRunOptions): Promise<SetupR
     if (!interactive) {
       console.log(`MEX setup · ${basename(projectRoot)} · ${mode}`);
       const unfinished = describeUnfinishedSetup(projectRoot);
-      if (unfinished) console.log(unfinished.line);
+      if (unfinished) console.log(hasTerminal ? unfinished.line
+        : `MEX setup ${unfinished.done}/${unfinished.total}, not finished. To continue, run \`mex setup next --start\` in this session and do what it prints.`);
       let lastGraphPhase = "";
       let lastGraphLogAt = 0;
       const result = await runHeadlessSetup({
@@ -74,8 +103,17 @@ export async function runTerminalSetup(options: SetupRunOptions): Promise<SetupR
       for (const note of result.anchorNotes) console.log(`Action needed: ${note}`);
       if (!result.ready) {
         const handoff = result.prompt === SETUP_HANDOFF_PROMPT;
-        console.log(`\nSetup paused: scaffold population is still required.\n${handoff ? result.message : CONTINUE}`);
-        if (result.prompt) console.log(`\nPopulation prompt${handoff ? " (paste it into your agent)" : ""}:\n\n${result.prompt}`);
+        console.log("\nSetup paused: scaffold population is still required.");
+        if (hasTerminal) console.log(handoff ? result.message : CONTINUE);
+        else if (handoff) console.log("You are the population agent. Run `mex setup next --start` in this session and do exactly what it prints.\n"
+          + "Repeat until it prints that setup is complete. Existing authored files are preserved.\n"
+          + "Do not commit until setup reports complete.");
+        else {
+          console.log(result.message);
+          console.log(result.prompt ? AGENT_CONTINUE
+            : "Run `mex setup` again to continue. Existing authored files are preserved.\nDo not commit until setup reports complete (`mex setup` exits with code 0).");
+        }
+        if (result.prompt) console.log(`\nPopulation prompt${handoff && hasTerminal ? " (paste it into your agent)" : ""}:\n\n${result.prompt}`);
         return { outcome: "paused", exitCode: 2, message: "Scaffold population is still required." };
       }
       console.log(result.message);
@@ -143,11 +181,18 @@ export async function runTerminalSetup(options: SetupRunOptions): Promise<SetupR
       pending?.({ type: "cancel" });
     };
     let outcome: SetupRunResult | undefined;
-    let validated: HeadlessSetupResult | undefined;
+    // Prepared but uncommitted: skip the picker and the engine and go straight
+    // to the reviewed commit on the completion page (#284).
+    let validated: HeadlessSetupResult | undefined = health?.needsCommitOnly ? {
+      mode, stage: "ready", populated: true, ready: true, selectedTools, prompt: null,
+      populationTool: null, populationCompleted: true,
+      commitCommands: setupCommitCheckpointCommands(selectedTools), anchorNotes: [],
+      message: "Graph and Wiki are ready. Review and commit the canonical MEX setup.",
+    } : undefined;
     let anchorNotes: readonly string[] = [];
     let populationFailure: string | undefined;
     try {
-      const action = await choose();
+      const action: TerminalSetupAction = validated ? { type: "start" } : await choose();
       if (action.type !== "start") throwIfSetupAborted(abort.signal);
       const focusedTool = action.type === "start" ? action.tool : undefined;
       if (focusedTool) {
@@ -243,7 +288,7 @@ export async function runTerminalSetup(options: SetupRunOptions): Promise<SetupR
             });
             if (!result.ready) {
               outcome = { outcome: populationFailure ? "failed" : "paused", exitCode: populationFailure ? 1 : 2,
-                message: `${populationFailure ? `Setup failed: ${populationFailure}` : `Setup paused at population. ${result.message}`} ${describeUnfinishedSetup(projectRoot)?.line ?? CONTINUE}` };
+                message: `${populationFailure ? `Setup failed: ${populationFailure}` : `Setup paused at population. ${result.message}`} ${describeUnfinishedSetup(projectRoot)?.line ? `${describeUnfinishedSetup(projectRoot)!.line} ` : ""}${CONTINUE}` };
               continue;
             }
             validated = result;
@@ -267,7 +312,7 @@ export async function runTerminalSetup(options: SetupRunOptions): Promise<SetupR
           const { projectSetupStatus } = await import("../hub/setup/readiness.js");
           const finished = await projectSetupStatus(projectRoot);
           const message = finished.mode === "agent-memory" || finished.ready
-            ? `Setup complete.${validated.coverageNotice ? ` ${validated.coverageNotice}` : ""}${validated.groundingNotice ? ` ${validated.groundingNotice}` : ""} Hub stopped. Run \`mex hub\` to open Hub again.`
+            ? `Setup complete. Hub stopped.${validated.coverageNotice ? ` ${validated.coverageNotice}` : ""}${validated.groundingNotice ? ` ${validated.groundingNotice}` : ""} Run \`mex hub\` to open Hub again.`
             : `${validated.message} Hub stopped. Run \`mex setup --browser\` to reopen the completion page.`;
           outcome = { outcome: "complete", exitCode: 0, message };
         } catch (error) {
@@ -307,6 +352,12 @@ export async function runTerminalSetup(options: SetupRunOptions): Promise<SetupR
 function pressEnterToReturn(signal: AbortSignal): Promise<"return" | "cancel"> {
   stdout.write("Press Enter to return to MEX…");
   return waitForTerminalReturn(signal);
+}
+
+/** An explicit tool choice equal to the saved one changes nothing for a rerun. */
+function sameTools(requested: readonly AiTool[], configured: readonly AiTool[]): boolean {
+  const wanted = new Set(requested);
+  return wanted.size === new Set(configured).size && configured.every(tool => wanted.has(tool));
 }
 
 function previewSetup(projectRoot: string, mode: "code-repo" | "agent-memory", tools: AiTool[], explicit: boolean): SetupRunResult {
