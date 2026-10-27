@@ -12,12 +12,13 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  realpath,
   realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { lstat as lstatAsync, open as openAsync, realpath as realpathAsync } from "node:fs/promises";
+import { lstat as lstatAsync, open as openAsync } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isSameResolvedPath, toPosix } from "../paths.js";
@@ -358,16 +359,18 @@ const MAX_PROJECT_INPUTS_BYTES = 32 * 1024 * 1024;
 
 /**
  * Project inputs (#281) with each path stored once: a monorepo's projects
- * read largely the same files.
+ * read largely the same files. Inputs outside the root, such as the
+ * compiler's default libraries, are stored relative to it so the graph
+ * carries no checkout path.
  */
-function encodeProjectInputs(inputs: Record<string, CompilerProjectInputs>): string | undefined {
+function encodeProjectInputs(root: string, inputs: Record<string, CompilerProjectInputs>): string | undefined {
   const paths: string[] = [];
   const index = new Map<string, number>();
   const intern = (path: string): number => {
     let at = index.get(path);
     if (at === undefined) {
       at = paths.length;
-      paths.push(path);
+      paths.push(isAbsolute(path) ? relative(root, path).replaceAll("\\", "/") : path);
       index.set(path, at);
     }
     return at;
@@ -378,19 +381,19 @@ function encodeProjectInputs(inputs: Record<string, CompilerProjectInputs>): str
   return encoded.length <= MAX_PROJECT_INPUTS_BYTES ? encoded : undefined;
 }
 
-function decodeProjectInputs(encoded: string | null): Record<string, CompilerProjectInputs> | undefined {
+function decodeProjectInputs(root: string, encoded: string | null): Record<string, CompilerProjectInputs> | undefined {
   if (!encoded) return undefined;
   try {
     const { paths, projects } = JSON.parse(encoded) as {
       paths: string[]; projects: Record<string, { observed: number[]; state: number[] }>;
     };
-    const resolve = (at: number): string => {
+    const pathAt = (at: number): string => {
       const path = paths[at];
       if (typeof path !== "string") throw new Error("invalid project input");
-      return path;
+      return path === ".." || path.startsWith("../") ? resolve(root, path).replaceAll("\\", "/") : path;
     };
     return Object.fromEntries(Object.entries(projects)
-      .map(([id, entry]) => [id, { observed: entry.observed.map(resolve), state: entry.state.map(resolve) }]));
+      .map(([id, entry]) => [id, { observed: entry.observed.map(pathAt), state: entry.state.map(pathAt) }]));
   } catch {
     return undefined;
   }
@@ -709,7 +712,7 @@ class GraphEngineImpl implements GraphEngine {
       store.setMetadata(GRAPH_SNAPSHOT_METADATA_KEY, serializedSnapshot);
       store.setMetadata(EXTRACTION_CACHE_IDENTITY_KEY, staged.extraction.cache.identity);
       store.setMetadata(EXTRACTION_PROJECT_STATES_KEY, JSON.stringify(staged.extraction.cache.projectStates));
-      const projectInputs = encodeProjectInputs(staged.extraction.cache.projectInputs);
+      const projectInputs = encodeProjectInputs(root, staged.extraction.cache.projectInputs);
       if (projectInputs === undefined) store.deleteMetadata(EXTRACTION_PROJECT_INPUTS_KEY);
       else store.setMetadata(EXTRACTION_PROJECT_INPUTS_KEY, projectInputs);
       if ("reason" in grouped) store.deleteMetadata(INCREMENTAL_STATE_METADATA_KEY);
@@ -945,7 +948,7 @@ function loadExtractionReuse(store: GraphStore, root: string): ExtractionReuse |
     identity: store.getMetadata(EXTRACTION_CACHE_IDENTITY_KEY),
     stored: store.getExtractionCache(),
     projectStates,
-    projectInputs: decodeProjectInputs(store.getMetadata(EXTRACTION_PROJECT_INPUTS_KEY)),
+    projectInputs: decodeProjectInputs(root, store.getMetadata(EXTRACTION_PROJECT_INPUTS_KEY)),
     fingerprints,
     records: new Map(store.getAllFileRecords().map((record) => [record.path, record])),
   };
@@ -2354,6 +2357,17 @@ function readStableUtf8File(
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * The JavaScript resolver `realpathSync` uses, asynchronously. The native one
+ * behind `fs/promises` expands Windows 8.3 short names (a runner's TEMP), so its
+ * answer would not compare equal to paths this engine resolved synchronously.
+ */
+function realpathAsync(path: string): Promise<string> {
+  return new Promise((resolveRealpath, reject) => {
+    realpath(path, (error, resolved) => (error ? reject(error) : resolveRealpath(resolved)));
+  });
 }
 
 /** {@link readStableUtf8File} through asynchronous calls, with the same checks in the same order. */
