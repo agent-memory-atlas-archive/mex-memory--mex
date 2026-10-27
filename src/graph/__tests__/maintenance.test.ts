@@ -513,9 +513,13 @@ describe("graph maintenance", () => {
   // exact bytes skip the next audit.
   it("records the audited digest it publishes and still audits changed bytes", async () => {
     const root = temporaryRoot();
-    source(root, "src/service.ts", "export function service(value: number): number {\n  return value + 1;\n}\n");
+    // Long enough that its fingerprint owns LSH buckets (see `indexedInLsh`).
+    const service = (step: number) => "export function service(value: number): number {\n"
+      + `  const first = value + ${step};\n  const second = first * 2;\n  const third = second - 3;\n`
+      + "  if (third > 10) return third / 4;\n  return first + second + third;\n}\n";
+    source(root, "src/service.ts", service(1));
     const dbPath = await buildBaseline(root);
-    source(root, "src/service.ts", "export function service(value: number): number {\n  return value + 2;\n}\n");
+    source(root, "src/service.ts", service(2));
     expect((await refreshGraph(root)).status.status).toBe("fresh");
     const record = JSON.parse(readFileSync(`${realpathSync(dbPath)}-audit.json`, "utf8")) as { digest: string };
     expect(record.digest).toBe(sha256(dbPath));

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { openSqlite, type SqliteDatabase } from "../db/sqlite.js";
 import { GraphStore } from "../db/store.js";
 import { FingerprintStore, upsertFingerprintsInOwnedTransaction } from "../fingerprint-store.js";
+import { MIN_TOKENS } from "../config.js";
 import { encodeMinhash } from "../fingerprint.js";
 import type { Fingerprint } from "../reconcile.js";
 
@@ -16,7 +17,8 @@ function value(offset: number): Fingerprint {
   return {
     minhash: Array.from({ length: 64 }, (_, index) => offset + index),
     neighbors: [`neighbor:${offset}`],
-    tokenCount: offset,
+    // Large enough to own LSH buckets (see `indexedInLsh`).
+    tokenCount: MIN_TOKENS + offset,
   };
 }
 
@@ -80,6 +82,18 @@ describe("fingerprint transaction ownership", () => {
     db.prepare(`UPDATE node_fingerprints SET ${column} = ? WHERE node_id = 'a'`).run(invalid);
     expect(() => store.get("a")).toThrow("Invalid fingerprint");
     expect(() => store.lookup(value(1))).toThrow("Invalid fingerprint");
+  });
+
+  it("keeps a small fingerprint readable without LSH buckets", () => {
+    const { db, store } = fixture();
+    const small = { ...value(7), tokenCount: MIN_TOKENS - 1 };
+    store.upsertMany([{ nodeId: "a", fingerprint: small }]);
+    const ref = (db.prepare("SELECT CAST(ref AS TEXT) AS ref FROM node_fingerprints WHERE node_id = 'a'").get() as { ref: string }).ref;
+    expect(db.prepare("SELECT COUNT(*) AS count FROM lsh_buckets WHERE ref = ?").get(BigInt(ref))).toEqual({ count: 0 });
+    expect(store.get("a")).toEqual(small);
+    expect(store.lookup(small)).toEqual([]);
+    store.upsertMany([{ nodeId: "a", fingerprint: value(7) }]);
+    expect(store.lookup(value(7)).map((entry) => entry.nodeId)).toEqual(["a"]);
   });
 
   it("avoids the growing nested savepoint only when the publisher explicitly owns rollback", () => {

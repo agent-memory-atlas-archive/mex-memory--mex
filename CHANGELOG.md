@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - Setup splits larger repositories into per-subsystem tasks, with the shared context task running alongside them. Up to `MEX_SETUP_PARALLEL_RUNS` background agents or one-paste tasks run at once (default 3, configurable from 1 to 8). Finished tasks are kept on rerun; MEX writes the final routing and pattern links without another agent session.
 - Background subsystem population can start while the code graph builds; MEX waits for the graph before applying facts. The terminal and Hub show subsystem progress and skipped areas.
 - `mex wiki apply` checks freshness for linked sources and refreshes grounding verdicts for affected entities, avoiding a full source scan and grounding refresh for each batch.
+- Code graph builds and refreshes take less time and memory on large TypeScript monorepos (#281). On a 9,400-file monorepo, a build that previously ran out of memory at the default heap now completes; a one-file refresh reuses unchanged tsconfig projects, and `graph.db` is about 27% smaller. CLI `mex graph rebuild` and `refresh` now run in the same memory-sized worker as Hub. Declarations whose types name an alias they do not import get a new signature, and so a new node id, and the first refresh after upgrading rebuilds the graph.
 
 ### Fixed
 

@@ -26,8 +26,9 @@ import type { Diagnostic, RepoState } from "../team/contracts/shared.js";
 import { DB_SCHEMA_VERSION, detectGraphSchemaLineage } from "./db/database.js";
 import { openSqlite, type SqliteDatabase } from "./db/sqlite.js";
 import { holdsAuditedBytes } from "./audit-record.js";
+import { timeGraphPhase, timeGraphPhaseAsync } from "./phase-timing.js";
 import { recallSource, rememberSource } from "./source-memo.js";
-import { BANDS, K } from "./config.js";
+import { BANDS, K, MIN_TOKENS } from "./config.js";
 import {
   GRAPH_CORPUS_GLOB_OPTIONS,
   graphCorpusIgnoreGlobs,
@@ -41,7 +42,7 @@ import {
 } from "./corpus-policy.js";
 import { graphManifest, graphManifestDiffersOnlyByConfig } from "./manifest.js";
 import { isSupportedSourceFile } from "./extraction/grammars.js";
-import { bandHashInts, decodeMinhash } from "./fingerprint.js";
+import { bandHashInts, decodeMinhash, indexedInLsh } from "./fingerprint.js";
 import type { Fingerprint } from "./reconcile.js";
 import {
   computeSourceCorpusDigest,
@@ -532,19 +533,19 @@ async function inspectGraphStatusAttempt(
   }
   const database = contained.database;
   const diagnostics: Diagnostic[] = [];
-  const repo = await inspectRepoState(projectRoot, observedAt);
+  const repo = await timeGraphPhaseAsync("inspect.repo", () => inspectRepoState(projectRoot, observedAt));
   const currentRepo = repo.state;
   diagnostics.push(...repo.diagnostics);
-  const live = await inspectLiveSources(
+  const live = await timeGraphPhaseAsync("inspect.sources", () => inspectLiveSources(
     projectRoot,
     database.projectRootRealPath,
     maxChangedPaths,
     context.options.internal?.liveSourceReadConcurrency ?? LIVE_SOURCE_READ_CONCURRENCY,
     (path) => context.options.internal?.afterSourceRead?.(path, "initial"),
     context.options.sourceScope,
-  );
+  ));
   diagnostics.push(...live.diagnostics);
-  const manifest = inspectCurrentManifest(projectRoot, diagnostics);
+  const manifest = timeGraphPhase("inspect.manifest", () => inspectCurrentManifest(projectRoot, diagnostics));
   let buildPrerequisitesComplete = repo.complete && live.complete && manifest !== null;
 
   let fileStat: ReturnType<typeof statSync>;
@@ -765,7 +766,7 @@ async function inspectGraphStatusAttempt(
     }
 
     try {
-      if (detectGraphSchemaLineage(db, schemaVersion) !== "v4") {
+      if (timeGraphPhase("inspect.lineage", () => detectGraphSchemaLineage(db!, schemaVersion)) !== "v4") {
         throw new Error("unexpected current schema lineage");
       }
     } catch {
@@ -786,7 +787,7 @@ async function inspectGraphStatusAttempt(
       }));
     }
 
-    const schemaFailures = inspectRequiredSchema(db);
+    const schemaFailures = timeGraphPhase("inspect.schema", () => inspectRequiredSchema(db!));
     if (schemaFailures.length > 0) {
       diagnostics.push({
         code: "GRAPH_INDEX_SCHEMA_INVALID",
@@ -810,12 +811,12 @@ async function inspectGraphStatusAttempt(
     // observation comparison regardless. Any doubt runs the full audit.
     // A file holding exactly the bytes of a database that already passed the
     // full audit cannot fail it (issue #209); proven by SHA-256, not by stat.
-    const structureAudited = isAuditedDatabase(
+    const structureAudited = timeGraphPhase("inspect.auditIdentity", () => isAuditedDatabase(
       context.options.auditedDatabase,
       database.canonicalPath,
       databaseFileIdentity(fileStat),
-    ) || holdsAuditedBytes(database.canonicalPath, fileStat!);
-    const integrity = structureAudited ? [] : quickCheck(db);
+    ) || holdsAuditedBytes(database.canonicalPath, fileStat!));
+    const integrity = structureAudited ? [] : timeGraphPhase("inspect.quickCheck", () => quickCheck(db!));
     if (integrity.length > 0) {
       diagnostics.push({
         code: "GRAPH_INDEX_CORRUPT",
@@ -834,11 +835,11 @@ async function inspectGraphStatusAttempt(
         }));
     }
 
-    const coreInvariantFailures = structureAudited ? [] : inspectCoreInvariants(db, {
+    const coreInvariantFailures = structureAudited ? [] : timeGraphPhase("inspect.invariants", () => inspectCoreInvariants(db!, {
       fingerprints: context.options.structuralAudit !== "graph",
       bandHashMemo: context.options.bandHashMemo,
       ...(context.options.fingerprintScope ? { fingerprintScope: context.options.fingerprintScope } : {}),
-    });
+    }));
     if (coreInvariantFailures.length > 0) {
       diagnostics.push({
         code: "GRAPH_INDEX_INVARIANT_FAILED",
@@ -904,18 +905,18 @@ async function inspectGraphStatusAttempt(
     }
 
     const semantic = snapshot
-      ? inspectSemanticInputs(
+      ? timeGraphPhase("inspect.semanticInputs", () => inspectSemanticInputs(
           projectRoot,
           database.projectRootRealPath,
           snapshot.semanticInputs,
           maxChangedPaths,
           (path) => context.options.internal?.afterSemanticInputRead?.(path, "initial"),
-        )
+        ))
       : emptySemanticInputs();
     diagnostics.push(...semantic.diagnostics);
     buildPrerequisitesComplete = buildPrerequisitesComplete && semantic.complete;
 
-    const files = readFiles(db);
+    const files = timeGraphPhase("inspect.files", () => readFiles(db!));
     if (context.options.sourceScope) {
       retainUnscopedSources(live, files.map(file => [file.path, file.content_hash]), context.options.sourceScope);
     }
@@ -1149,7 +1150,8 @@ async function inspectGraphStatusAttempt(
       database,
       databaseIdentity: databaseFileIdentity(fileStat),
     };
-    const validation = await validateFreshObservation(context, observation, degradations);
+    const validation = await timeGraphPhaseAsync("inspect.validateObservation", () =>
+      validateFreshObservation(context, observation, degradations));
     if (validation.stable) {
       observationRechecks.set(validation.freshObservation!, async () => {
         // The initial pass and its independent validation already established
@@ -1529,27 +1531,29 @@ async function validateFreshObservation(
     return unstableObservation("degraded", ["database path"]);
   }
 
-  const repo = await inspectRepoState(context.projectRoot, context.observedAt);
-  const live = await inspectLiveSources(
+  const repo = await timeGraphPhaseAsync("inspect.validation.repo", () =>
+    inspectRepoState(context.projectRoot, context.observedAt));
+  const live = await timeGraphPhaseAsync("inspect.validation.sources", () => inspectLiveSources(
     context.projectRoot,
     contained.database.projectRootRealPath,
     context.maxChangedPaths,
     context.options.internal?.liveSourceReadConcurrency ?? LIVE_SOURCE_READ_CONCURRENCY,
     (path) => context.options.internal?.afterSourceRead?.(path, "validation"),
     context.options.sourceScope,
-  );
+  ));
   if (context.options.sourceScope) {
     retainUnscopedSources(live, before.live.hashes, context.options.sourceScope);
   }
-  const semantic = inspectSemanticInputs(
+  const semantic = timeGraphPhase("inspect.validation.semanticInputs", () => inspectSemanticInputs(
     context.projectRoot,
     contained.database.projectRootRealPath,
     before.semanticInputs,
     context.maxChangedPaths,
     (path) => context.options.internal?.afterSemanticInputRead?.(path, "validation"),
-  );
+  ));
   const manifestDiagnostics: Diagnostic[] = [];
-  const manifest = inspectCurrentManifest(context.projectRoot, manifestDiagnostics);
+  const manifest = timeGraphPhase("inspect.validation.manifest", () =>
+    inspectCurrentManifest(context.projectRoot, manifestDiagnostics));
   if (!repo.complete || !live.complete || !semantic.complete || manifest === null) {
     const status = !repo.complete ? "degraded" : "stale";
     return {
@@ -1579,7 +1583,8 @@ async function validateFreshObservation(
   let snapshotRaw: string;
   let identity: string;
   try {
-    const snapshotIdentity = readSnapshotIdentity(contained.database.canonicalPath);
+    const snapshotIdentity = timeGraphPhase("inspect.validation.snapshot", () =>
+      readSnapshotIdentity(contained.database.canonicalPath));
     snapshotRaw = snapshotIdentity.snapshotRaw;
     identity = snapshotIdentity.databaseIdentity;
   } catch {
@@ -2659,15 +2664,19 @@ function inspectFingerprintInvariants(
 
 /**
  * The change-sized half of {@link fingerprintStorageIsExact}, for a delta
- * publication into a copy of a fully audited store: every fingerprint of a
- * rewritten file's nodes is well formed and owns each of its BANDS buckets
- * with the expected hash, and the store holds exactly BANDS buckets per
- * fingerprint. Fingerprints of other files are rows the audited store already
- * held; the bucket total catches a bucket left behind by a removed one.
+ * publication into a copy of a fully audited store: every indexed fingerprint
+ * of a rewritten file's nodes (see `indexedInLsh`) is well formed and owns
+ * each of its BANDS buckets with the expected hash, and the store holds
+ * exactly BANDS buckets per indexed fingerprint. Fingerprints of other files
+ * are rows the audited store already held; the bucket total catches a bucket
+ * left behind by a removed one, or one written for a small fingerprint. A
+ * store that still holds buckets for small fingerprints fails this check and
+ * gets the full one, which accepts them.
  */
 function fingerprintScopeIsExact(db: SqliteDatabase, paths: readonly string[]): boolean {
   const counts = db.prepare(
-    "SELECT (SELECT COUNT(*) FROM node_fingerprints) AS fingerprints, (SELECT COUNT(*) FROM lsh_buckets) AS buckets",
+    `SELECT (SELECT COUNT(*) FROM node_fingerprints WHERE token_count >= ${MIN_TOKENS}) AS fingerprints,
+            (SELECT COUNT(*) FROM lsh_buckets) AS buckets`,
   ).get() as { fingerprints?: unknown; buckets?: unknown } | undefined;
   if (typeof counts?.fingerprints !== "number" || counts.buckets !== counts.fingerprints * BANDS) return false;
   const rows = db.prepare(
@@ -2679,6 +2688,7 @@ function fingerprintScopeIsExact(db: SqliteDatabase, paths: readonly string[]): 
     if (typeof row.ref !== "string" || typeof row.node_id !== "string") return false;
     const fingerprint = decodeStoredFingerprint(row);
     if (!fingerprint) return false;
+    if (!indexedInLsh(fingerprint)) continue;
     const hashes = bandHashInts(fingerprint);
     const ref = BigInt(row.ref);
     for (let band = 0; band < BANDS; band++) {
@@ -2690,7 +2700,8 @@ function fingerprintScopeIsExact(db: SqliteDatabase, paths: readonly string[]): 
 
 /**
  * Whether every fingerprint is well formed and owns exactly its BANDS LSH
- * buckets with the expected hashes, and no other bucket exists: the verdict
+ * buckets with the expected hashes (a small one, see `indexedInLsh`, owns
+ * either all of them or none), and no other bucket exists: the verdict
  * of {@link orderedFingerprintAudit} when it finds nothing. It holds each
  * fingerprint's expected band hashes in memory and reads the buckets in their
  * primary-key order, so the LSH table is never sorted by ref, which was most
@@ -2700,7 +2711,19 @@ function fingerprintStorageIsExact(
   db: SqliteDatabase,
   bandHashMemo?: Map<string, readonly string[]>,
 ): boolean {
-  const expected = new Map<string, { hashes: readonly string[]; seen: Uint8Array }>();
+  // A small fingerprint's hashes are computed only if a bucket names it.
+  const expected = new Map<string, {
+    fingerprint: Fingerprint; key: string; hashes?: readonly string[]; seen: Uint8Array; optional: boolean;
+  }>();
+  const hashesOf = (entry: { fingerprint: Fingerprint; key: string; hashes?: readonly string[] }): readonly string[] => {
+    if (entry.hashes) return entry.hashes;
+    let hashes = bandHashMemo?.get(entry.key);
+    if (!hashes) {
+      hashes = bandHashInts(entry.fingerprint).map(String);
+      bandHashMemo?.set(entry.key, hashes);
+    }
+    return entry.hashes = hashes;
+  };
   const fingerprints = db.prepare(
     "SELECT CAST(ref AS TEXT) AS ref, node_id, minhash, neighbors, token_count FROM node_fingerprints",
   ).iterate() as IterableIterator<StoredFingerprintRow>;
@@ -2709,12 +2732,9 @@ function fingerprintStorageIsExact(
     const fingerprint = decodeStoredFingerprint(row);
     if (!fingerprint) return false;
     const key = bandHashMemo ? Buffer.from(row.minhash as Uint8Array).toString("latin1") : "";
-    let hashes = bandHashMemo?.get(key);
-    if (!hashes) {
-      hashes = bandHashInts(fingerprint).map(String);
-      bandHashMemo?.set(key, hashes);
-    }
-    expected.set(row.ref, { hashes, seen: new Uint8Array(BANDS) });
+    const entry = { fingerprint, key, seen: new Uint8Array(BANDS), optional: !indexedInLsh(fingerprint) };
+    if (!entry.optional) hashesOf(entry);
+    expected.set(row.ref, entry);
   }
   // One band at a time through the primary key: reading rows in batches is
   // far cheaper than stepping a cursor, and a batch stays small. The bands
@@ -2729,13 +2749,15 @@ function fingerprintStorageIsExact(
     visited += rows.length;
     for (const [ref, bandHash] of rows) {
       const entry = typeof ref === "string" ? expected.get(ref) : undefined;
-      if (!entry || entry.seen[band] !== 0 || bandHash !== entry.hashes[band]) return false;
+      if (!entry || entry.seen[band] !== 0 || bandHash !== hashesOf(entry)[band]) return false;
       entry.seen[band] = 1;
     }
   }
   const stored = db.prepare("SELECT COUNT(*) AS count FROM lsh_buckets").get() as { count?: unknown } | undefined;
   if (stored?.count !== visited) return false;
-  for (const entry of expected.values()) if (entry.seen.includes(0)) return false;
+  for (const entry of expected.values()) {
+    if (entry.seen.includes(0) && !(entry.optional && !entry.seen.includes(1))) return false;
+  }
   return true;
 }
 
@@ -2803,8 +2825,9 @@ function orderedFingerprintAudit(db: SqliteDatabase): string[] {
       bucketStep = bucketIterator.next();
       advanceMalformedBucketOwners();
     }
+    const unindexed = fingerprint !== null && !indexedInLsh(fingerprint) && bandCounts.every((count) => count === 0);
     for (const count of bandCounts) {
-      if (count === 0) missingBands += 1;
+      if (count === 0 && !unindexed) missingBands += 1;
       else if (count > 1) duplicateBuckets += count - 1;
     }
   }

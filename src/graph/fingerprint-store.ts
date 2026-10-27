@@ -1,5 +1,5 @@
 import type { GroundedSource, GroundingBaseline, GroundingSubject } from "./grounding.js";
-import { assertFingerprint, bandHashInts, decodeMinhash, encodeMinhash } from "./fingerprint.js";
+import { assertFingerprint, bandHashInts, decodeMinhash, encodeMinhash, indexedInLsh } from "./fingerprint.js";
 import { BANDS, K, ROWS } from "./config.js";
 import type { Fingerprint } from "./reconcile.js";
 import type { SQLInputValue } from "node:sqlite";
@@ -85,6 +85,7 @@ export function writeFingerprintDelta(
     bandHashInts(stored.fingerprint).forEach((bandHash, band) => deleteBucket.run(band, bandHash, stored.ref));
   };
   const insertBuckets = (fingerprint: Fingerprint, ref: bigint): void => {
+    if (!indexedInLsh(fingerprint)) return;
     bandHashInts(fingerprint).forEach((bandHash, band) => insertBucket.run(band, bandHash, ref));
   };
 
@@ -114,7 +115,8 @@ export function writeFingerprintDelta(
       continue;
     }
     const sameSketch = previous.fingerprint.minhash.length === fingerprint.minhash.length
-      && previous.fingerprint.minhash.every((value, index) => fingerprint.minhash[index] === value);
+      && previous.fingerprint.minhash.every((value, index) => fingerprint.minhash[index] === value)
+      && indexedInLsh(previous.fingerprint) === indexedInLsh(fingerprint);
     if (!sameSketch) deleteBuckets(previous);
     updateFingerprint.run(minhash, neighbors, fingerprint.tokenCount, previous.ref);
     if (!sameSketch) insertBuckets(fingerprint, previous.ref);
@@ -353,7 +355,7 @@ function writeFingerprints(
       const row = selectRef.get(nodeId) as { ref: string } | undefined;
       if (!row) throw new Error(`Fingerprint upsert failed for ${nodeId}.`);
       const ref = BigInt(row.ref);
-      insertBuckets.run(...buckets.flatMap((bandHash, band) => [band, bandHash, ref]));
+      if (indexedInLsh(fingerprint)) insertBuckets.run(...buckets.flatMap((bandHash, band) => [band, bandHash, ref]));
     }
     if (independentRollback) db.exec("RELEASE mex_fingerprint_upsert_many");
   } catch (error) {

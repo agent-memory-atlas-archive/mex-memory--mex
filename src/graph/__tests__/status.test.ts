@@ -1052,10 +1052,10 @@ describe("inspectGraphStatus", () => {
   it("rejects malformed reachable fingerprints before the reconciler can decode them", async () => {
     const root = temporaryRoot("mex-graph-fingerprint-shape-");
     source(root, "src/a.ts", `
-      export function alpha(value: number): number { return value + 1; }
-      export function beta(value: number): number { return value * 2; }
-      export function gamma(value: number): number { return value - 3; }
-      export function delta(value: number): number { return value / 4; }
+      export function alpha(value: number): number { const first = value + 1; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
+      export function beta(value: number): number { const first = value * 2; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
+      export function gamma(value: number): number { const first = value - 3; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
+      export function delta(value: number): number { const first = value / 4; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
     `);
     const dbPath = await build(root);
     const db = openSqlite(dbPath);
@@ -1101,10 +1101,10 @@ describe("inspectGraphStatus", () => {
   it("requires one correct LSH hash for every configured fingerprint band", async () => {
     const root = temporaryRoot("mex-graph-fingerprint-bands-");
     source(root, "src/a.ts", `
-      export function alpha(value: number): number { return value + 1; }
-      export function beta(value: number): number { return value * 2; }
-      export function gamma(value: number): number { return value - 3; }
-      export function delta(value: number): number { return value / 4; }
+      export function alpha(value: number): number { const first = value + 1; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
+      export function beta(value: number): number { const first = value * 2; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
+      export function gamma(value: number): number { const first = value - 3; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
+      export function delta(value: number): number { const first = value / 4; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
     `);
     const dbPath = await build(root);
     const db = openSqlite(dbPath);
@@ -1148,8 +1148,8 @@ describe("inspectGraphStatus", () => {
   ])("classifies $name as corrupt", async ({ corrupt, expected }) => {
     const root = temporaryRoot("mex-graph-orphan-buckets-");
     source(root, "src/a.ts", `
-      export function alpha(value: number): number { return value + 1; }
-      export function beta(value: number): number { return value * 2; }
+      export function alpha(value: number): number { const first = value + 1; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
+      export function beta(value: number): number { const first = value * 2; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
     `);
     const dbPath = await build(root);
     const db = openSqlite(dbPath);
@@ -1189,8 +1189,8 @@ describe("inspectGraphStatus", () => {
   ])("catches $name on its own", async ({ corrupt, expected }) => {
     const root = temporaryRoot("mex-graph-lsh-class-");
     source(root, "src/a.ts", `
-      export function alpha(value: number): number { return value + 1; }
-      export function beta(value: number): number { return value * 2; }
+      export function alpha(value: number): number { const first = value + 1; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
+      export function beta(value: number): number { const first = value * 2; const second = first * 2; const third = second - 3; if (third > 10) { return third / 4; } return first + second + third; }
     `);
     const dbPath = await build(root);
     expect((await inspect(root)).status).toBe("fresh");

@@ -12,11 +12,13 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  realpath,
   realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { lstat as lstatAsync, open as openAsync } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isSameResolvedPath, toPosix } from "../paths.js";
@@ -61,6 +63,7 @@ import {
   type CompilerExtractedNode,
   type CompilerExtractionOptions,
   type CompilerIncrementalInput,
+  type CompilerProjectInputs,
   type CompilerExtractionResult,
   type CompilerFileExtraction,
   type CompilerSemanticInput,
@@ -105,7 +108,7 @@ import {
   type GraphSnapshotSemanticInput,
 } from "./snapshot.js";
 import { getCallees, getCallers, getIncoming, getOutgoing } from "./traversal/traversal.js";
-import { recordGraphPhase, timeGraphPhase, timeGraphPhaseAsync } from "./phase-timing.js";
+import { recordGraphMemory, recordGraphPhase, timeGraphPhase, timeGraphPhaseAsync } from "./phase-timing.js";
 import { recallSource, rememberSource, reserveHeldBytes } from "./source-memo.js";
 import type { GraphEdge, GraphNode, Language, ReferenceKind } from "./types.js";
 
@@ -332,6 +335,7 @@ interface StagedExtraction {
 interface ExtractionCacheState {
   identity: string;
   projectStates: Record<string, string>;
+  projectInputs: Record<string, CompilerProjectInputs>;
   entries: Array<{ path: string; contentHash: string; payload: Uint8Array; changed: boolean }>;
 }
 
@@ -340,6 +344,7 @@ interface ExtractionReuse {
   identity: string | null;
   stored: Map<string, StoredExtraction>;
   projectStates: Record<string, string>;
+  projectInputs?: Record<string, CompilerProjectInputs>;
   /** Stored fingerprint sketches by node id; neighbours are always recomputed. */
   fingerprints: ReadonlyMap<string, Pick<Fingerprint, "minhash" | "tokenCount">>;
   /** Stored file records, to know which files' sketches still hold. */
@@ -348,6 +353,51 @@ interface ExtractionReuse {
 
 const EXTRACTION_CACHE_IDENTITY_KEY = "extraction_cache_identity";
 const EXTRACTION_PROJECT_STATES_KEY = "extraction_project_states";
+const EXTRACTION_PROJECT_INPUTS_KEY = "extraction_project_inputs";
+/** Past this, project inputs are not recorded and every refresh builds every program. */
+const MAX_PROJECT_INPUTS_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Project inputs (#281) with each path stored once: a monorepo's projects
+ * read largely the same files. Inputs outside the root, such as the
+ * compiler's default libraries, are stored relative to it so the graph
+ * carries no checkout path.
+ */
+function encodeProjectInputs(root: string, inputs: Record<string, CompilerProjectInputs>): string | undefined {
+  const paths: string[] = [];
+  const index = new Map<string, number>();
+  const intern = (path: string): number => {
+    let at = index.get(path);
+    if (at === undefined) {
+      at = paths.length;
+      paths.push(isAbsolute(path) ? relative(root, path).replaceAll("\\", "/") : path);
+      index.set(path, at);
+    }
+    return at;
+  };
+  const projects = Object.fromEntries(Object.entries(inputs).sort(([left], [right]) => compareCodePoints(left, right))
+    .map(([id, entry]) => [id, { observed: entry.observed.map(intern), state: entry.state.map(intern) }]));
+  const encoded = JSON.stringify({ paths, projects });
+  return encoded.length <= MAX_PROJECT_INPUTS_BYTES ? encoded : undefined;
+}
+
+function decodeProjectInputs(root: string, encoded: string | null): Record<string, CompilerProjectInputs> | undefined {
+  if (!encoded) return undefined;
+  try {
+    const { paths, projects } = JSON.parse(encoded) as {
+      paths: string[]; projects: Record<string, { observed: number[]; state: number[] }>;
+    };
+    const pathAt = (at: number): string => {
+      const path = paths[at];
+      if (typeof path !== "string") throw new Error("invalid project input");
+      return path === ".." || path.startsWith("../") ? resolve(root, path).replaceAll("\\", "/") : path;
+    };
+    return Object.fromEntries(Object.entries(projects)
+      .map(([id, entry]) => [id, { observed: entry.observed.map(pathAt), state: entry.state.map(pathAt) }]));
+  } catch {
+    return undefined;
+  }
+}
 
 class GraphEngineImpl implements GraphEngine {
   private readonly rootDir: string;
@@ -388,11 +438,11 @@ class GraphEngineImpl implements GraphEngine {
   private getStore(allowRebuild = false): GraphStore {
     if (!this.store) {
       this.internal.beforeDatabaseOpen?.();
-      this.db = openGraphDatabase(this.dbPath, {
+      this.db = timeGraphPhase("engine.openDatabase", () => openGraphDatabase(this.dbPath, {
         allowRebuild,
         readOnly: this.readOnly,
         immutable: this.immutable,
-      });
+      }));
       this.store = new GraphStore(this.db);
     }
     return this.store;
@@ -413,11 +463,11 @@ class GraphEngineImpl implements GraphEngine {
       { reason: "a rebuild extracts in full" },
     );
     try {
-      this.assertNoNewParseFailures(staged);
-      const { publication: _publication, ...result } = this.publish(staged, root, gitBeforeStaging, false);
+      timeGraphPhase("stage.parseRegressionCheck", () => this.assertNoNewParseFailures(staged));
+      const { publication: _publication, ...result } = await this.publish(staged, root, gitBeforeStaging, false);
       return { ...result, durationMs: Date.now() - started };
     } finally {
-      staged.sourceSpool.dispose();
+      timeGraphPhase("stage.disposeSpool", () => staged.sourceSpool.dispose());
     }
   }
 
@@ -438,8 +488,8 @@ class GraphEngineImpl implements GraphEngine {
     const sourceSpool = new GraphSourceSpool(this.internal.sourceSpoolDirectory);
     let prepared: PreparedCorpus | undefined;
     try {
-      const corpus = timeGraphPhase("sync.discover", () =>
-        discoverSourceFiles(this.rootDir, this.sourceFileAccess, sourceSpool));
+      const corpus = await timeGraphPhaseAsync("sync.discover", () =>
+        discoverSourceFilesConcurrently(this.rootDir, this.sourceFileAccess, sourceSpool));
       if (changedSources.length === 0) {
         const unchanged = unchangedGraphSnapshot(this.rootDir, store, gitBeforeStaging, manifest, corpus.files);
         if (unchanged) {
@@ -485,12 +535,12 @@ class GraphEngineImpl implements GraphEngine {
           message: "The changed source still exists but was absent from the staged corpus.",
         })));
       }
-      this.assertNoNewParseFailures(staged);
+      timeGraphPhase("stage.parseRegressionCheck", () => this.assertNoNewParseFailures(staged));
       const previousFiles = new Map(this.getStore(true).getAllFileRecords()
         .map((file) => [file.path, file.contentHash]));
       const filesChanged = staged.files.filter((file) => previousFiles.get(file.record.path) !== file.record.contentHash)
         .length + [...previousFiles.keys()].filter((path) => !stagedByPath.has(path)).length;
-      const { publication, ...result } = timeGraphPhase("publish.total", () => this.publish(
+      const { publication, ...result } = await timeGraphPhaseAsync("publish.total", () => this.publish(
         staged,
         this.rootDir,
         gitBeforeStaging,
@@ -508,7 +558,7 @@ class GraphEngineImpl implements GraphEngine {
         durationMs: Date.now() - started,
       };
     } finally {
-      staged.sourceSpool.dispose();
+      timeGraphPhase("stage.disposeSpool", () => staged.sourceSpool.dispose());
     }
   }
 
@@ -553,12 +603,12 @@ class GraphEngineImpl implements GraphEngine {
     })));
   }
 
-  private publish(
+  private async publish(
     staged: StagedCorpus,
     root: string,
     gitBeforeStaging: GraphGitProvenance,
     allowDelta: boolean,
-  ): Omit<BuildResult, "durationMs"> & { publication: GraphPublicationReport } {
+  ): Promise<Omit<BuildResult, "durationMs"> & { publication: GraphPublicationReport }> {
     this.internal.beforePublication?.();
     const store = this.getStore(true);
     const freshNodes = staged.files.flatMap((file) => file.nodes);
@@ -566,6 +616,7 @@ class GraphEngineImpl implements GraphEngine {
     // owned rows changed. Any reason it cannot is a full publication, which
     // also records the digests the next refresh compares against.
     const grouped = timeGraphPhase("publish.rowGroups", () => groupRowsByFile(staged.files, staged.fingerprints));
+    recordGraphMemory("publish.afterRowGroups");
     const planned = !allowDelta ? { reason: "a full publication was requested" }
       : "reason" in grouped ? grouped
       : timeGraphPhase("publish.deltaPlan", () => planRowDelta(store, this.db!, grouped));
@@ -577,7 +628,7 @@ class GraphEngineImpl implements GraphEngine {
     // only after they finish, at the final synchronous boundary before the
     // snapshot is constructed and its publication transaction begins.
     const coverage = timeGraphPhase("publish.coverage", () => captureGraphCoverage(root));
-    const git = timeGraphPhase("publish.verifyInputs", () => verifyPublicationInputs(
+    const git = await timeGraphPhaseAsync("publish.verifyInputs", () => verifyPublicationInputs(
       root,
       staged,
       gitBeforeStaging,
@@ -614,6 +665,7 @@ class GraphEngineImpl implements GraphEngine {
     });
     const serializedSnapshot = serializeGraphSnapshot(snapshot);
 
+    recordGraphMemory("publish.beforeTransaction");
     store.transaction(() => {
       if (delta) {
         const stagedByPath = new Map(staged.files.map((file) => [file.record.path, file]));
@@ -660,10 +712,14 @@ class GraphEngineImpl implements GraphEngine {
       store.setMetadata(GRAPH_SNAPSHOT_METADATA_KEY, serializedSnapshot);
       store.setMetadata(EXTRACTION_CACHE_IDENTITY_KEY, staged.extraction.cache.identity);
       store.setMetadata(EXTRACTION_PROJECT_STATES_KEY, JSON.stringify(staged.extraction.cache.projectStates));
+      const projectInputs = encodeProjectInputs(root, staged.extraction.cache.projectInputs);
+      if (projectInputs === undefined) store.deleteMetadata(EXTRACTION_PROJECT_INPUTS_KEY);
+      else store.setMetadata(EXTRACTION_PROJECT_INPUTS_KEY, projectInputs);
       if ("reason" in grouped) store.deleteMetadata(INCREMENTAL_STATE_METADATA_KEY);
       else store.setMetadata(INCREMENTAL_STATE_METADATA_KEY, incrementalStateMarker(serializedSnapshot));
       markGraphReady(this.db!, staged.manifestHash);
     });
+    recordGraphMemory("publish.afterTransaction");
 
     return {
       filesIndexed: staged.files.length,
@@ -708,10 +764,10 @@ class GraphEngineImpl implements GraphEngine {
     timeGraphPhase("publish.insert.nodes", () => {
       for (const file of staged.files) for (const node of file.nodes) store.insertNode(node);
     });
+    timeGraphPhase("publish.insert.edges", () => {
+      edgeCount = store.insertEdges(staged.files.flatMap((file) => file.edges));
+    });
     for (const file of staged.files) {
-      const edgesStarted = performance.now();
-      for (const edge of file.edges) if (store.insertEdge(edge)) edgeCount++;
-      recordGraphPhase("publish.insert.edges", performance.now() - edgesStarted);
       // A resolved reference is an edge. Keeping the row too duplicated one
       // for every reference the resolver bound — 27-73% of this table on
       // every repository measured, all of them already in `edges`. Resolution
@@ -892,6 +948,7 @@ function loadExtractionReuse(store: GraphStore, root: string): ExtractionReuse |
     identity: store.getMetadata(EXTRACTION_CACHE_IDENTITY_KEY),
     stored: store.getExtractionCache(),
     projectStates,
+    projectInputs: decodeProjectInputs(root, store.getMetadata(EXTRACTION_PROJECT_INPUTS_KEY)),
     fingerprints,
     records: new Map(store.getAllFileRecords().map((record) => [record.path, record])),
   };
@@ -909,8 +966,8 @@ async function stageCorpus(
 ): Promise<StagedCorpus> {
   const sourceSpool = prepared?.sourceSpool ?? new GraphSourceSpool(internal.sourceSpoolDirectory);
   try {
-    const { files: discovered, skipped } = prepared?.corpus ?? timeGraphPhase("stage.discover", () =>
-      discoverSourceFiles(root, sourceFileAccess, sourceSpool));
+    const { files: discovered, skipped } = prepared?.corpus ?? await timeGraphPhaseAsync("stage.discover", () =>
+      discoverSourceFilesConcurrently(root, sourceFileAccess, sourceSpool));
     const configSources = timeGraphPhase("stage.config", () => discoverGraphConfigSources(root));
     const stagedConfigHash = configHashForSources(configSources);
     if (stagedConfigHash !== manifest.configHash) {
@@ -926,20 +983,22 @@ async function stageCorpus(
     const compilerPaths = compilerFiles.map((file) => file.relPath);
     const compilerInputs: CompilerStagedInput[] = [...configSources.entries()]
       .map(([filePath, source]) => ({ filePath, source }));
-    let compilerSourceBytes = 0;
-    for (const file of compilerFiles) {
-      const source = sourceSpool.read(file);
-      try {
-        compilerSourceBytes = addGraphCompilerSourceBytes(
-          compilerSourceBytes,
-          Buffer.byteLength(source, "utf8"),
-        );
-      } catch (error) {
-        throw new GraphSourceStagingError([sourceStagingFailure(file.relPath, "read", error)]);
+    timeGraphPhase("stage.compilerInputs", () => {
+      let compilerSourceBytes = 0;
+      for (const file of compilerFiles) {
+        const source = sourceSpool.read(file);
+        try {
+          compilerSourceBytes = addGraphCompilerSourceBytes(
+            compilerSourceBytes,
+            Buffer.byteLength(source, "utf8"),
+          );
+        } catch (error) {
+          throw new GraphSourceStagingError([sourceStagingFailure(file.relPath, "read", error)]);
+        }
+        compilerInputs.push({ filePath: file.relPath, source });
       }
-      compilerInputs.push({ filePath: file.relPath, source });
-    }
-    compilerInputs.sort((left, right) => compareCodePoints(left.filePath, right.filePath));
+      compilerInputs.sort((left, right) => compareCodePoints(left.filePath, right.filePath));
+    });
     internal.afterSemanticInputsStaged?.();
     const reportParsed = (completed: number): void => internal.onBuildProgress?.({
       phase: "parse",
@@ -1007,6 +1066,7 @@ async function stageCorpus(
             importers: plan.importers,
             maxAffected: incrementalClosureBudget(compilerPaths.length),
             projectStates: (reuse as ExtractionReuse).projectStates,
+            projectInputs: (reuse as ExtractionReuse).projectInputs,
           });
         } catch (error) {
           if (!(error instanceof CompilerIncrementalFallback)) throw error;
@@ -1066,6 +1126,13 @@ async function stageCorpus(
       }
     });
     compiler.captures.length = 0;
+    if (!("reason" in plan)) {
+      plan.captures.clear();
+      plan.affected.clear();
+      plan.gated.clear();
+      plan.modified.clear();
+      plan.importers.clear();
+    }
     const cachedTrees = "reason" in plan ? undefined : plan.trees;
 
     let parsed = compiler.files.length;
@@ -1097,6 +1164,14 @@ async function stageCorpus(
     // has been copied. Per-node compiler spans survive only until fingerprinting.
     compiler.files.length = 0;
     compiler.projects.length = 0;
+    if (!("reason" in plan)) plan.trees.clear();
+    storedExtraction.clear();
+    const gc = (globalThis as { gc?: () => void }).gc;
+    if (gc && process.memoryUsage().heapUsed >= 512 * 1024 * 1024) {
+      recordGraphMemory("stage.beforeCollection");
+      timeGraphPhase("stage.collectReleasedCompiler", gc);
+      recordGraphMemory("stage.afterCollection");
+    }
 
     internal.onBuildProgress?.({ phase: "resolve" });
     timeGraphPhase("stage.resolve", () =>
@@ -1108,6 +1183,7 @@ async function stageCorpus(
       sourceSpool,
       "reason" in reuse ? undefined : reuse,
     ));
+    recordGraphMemory("stage.afterFingerprints");
     const coveredPaths = new Set([...discovered.map((file) => file.relPath), ...configSources.keys()]);
     const semanticInputs = compiler.semanticInputs.filter((input) => !coveredPaths.has(input.filePath));
     if (semanticInputs.length > GRAPH_SNAPSHOT_MAX_SEMANTIC_INPUTS) {
@@ -1136,6 +1212,7 @@ async function stageCorpus(
         cache: {
           identity,
           projectStates: compiler.projectStates,
+          projectInputs: compiler.projectInputs,
           entries: discovered.flatMap((file) => cacheEntries.get(file.relPath) ?? []),
         },
       },
@@ -1960,6 +2037,95 @@ function inspectChangedSources(
  * so the staged corpus, `verifyPublicationInputs`, `sync`'s corpus comparison
  * and the freshness inspector all agree about which files exist.
  */
+/** Source files read at once by {@link discoverSourceFilesConcurrently}. */
+const DISCOVERY_READ_CONCURRENCY = 16;
+const DISCOVERY_READ_WINDOW = 512;
+
+/**
+ * {@link discoverSourceFiles} with the reads overlapped (#281): the same
+ * files, hashes, spool, skips, failures and limits, in the same order. Each
+ * read makes several file-system calls, and on a large corpus they waited one
+ * after another; status inspection already reads concurrently. Custom file
+ * access (tests, hosts) keeps the sequential path.
+ */
+async function discoverSourceFilesConcurrently(
+  root: string,
+  sourceFileAccess: GraphSourceFileAccess,
+  sourceSpool?: GraphSourceSpool,
+): Promise<DiscoveredCorpus> {
+  if (sourceFileAccess !== NODE_SOURCE_FILE_ACCESS) return discoverSourceFiles(root, sourceFileAccess, sourceSpool);
+  let matches: string[];
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(root);
+    matches = discoverBoundedGraphPaths(GRAPH_SUPPORTED_SOURCE_GLOB, {
+      ...GRAPH_CORPUS_GLOB_OPTIONS,
+      cwd: root,
+      ignore: graphCorpusIgnoreGlobs(root),
+    }, GRAPH_CORPUS_LIMITS.maxSourceFiles).map(toPosix);
+  } catch (error) {
+    throw new GraphSourceStagingError([sourceStagingFailure(".", "discover", error)]);
+  }
+  const canonicalDirectories = new Map<string, string>();
+  type Entry = { relPath: string; canonical?: string; containment?: unknown };
+  const entries: Entry[] = [];
+  for (const relPath of matches) {
+    if (!isSupportedSourceFile(relPath)) continue;
+    try {
+      entries.push({ relPath, canonical: resolveContainedRepoFile(root, canonicalRoot, relPath, canonicalDirectories) });
+    } catch (error) {
+      entries.push({ relPath, containment: error });
+    }
+  }
+  const files: DiscoveredFile[] = [];
+  const skipped: GraphSkippedSourceFile[] = [];
+  const failures: GraphSourceStagingFailure[] = [];
+  let sourceBytes = 0;
+  // A window at a time, so at most one window of sources is held unstaged.
+  for (let start = 0; start < entries.length; start += DISCOVERY_READ_WINDOW) {
+    const window = entries.slice(start, start + DISCOVERY_READ_WINDOW);
+    const reads = new Array<{ file?: Awaited<ReturnType<typeof readStableUtf8FileAsync>>; error?: unknown }>(window.length);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < window.length) {
+        const index = next++;
+        const entry = window[index]!;
+        if (entry.canonical === undefined) continue;
+        try {
+          reads[index] = { file: await readStableUtf8FileAsync(entry.canonical, resolve(root, entry.relPath)) };
+        } catch (error) {
+          reads[index] = { error };
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(DISCOVERY_READ_CONCURRENCY, window.length) }, worker));
+    for (const [index, entry] of window.entries()) {
+      if (entry.canonical === undefined) {
+        failures.push(sourceStagingFailure(entry.relPath, "discover", entry.containment));
+        continue;
+      }
+      const read = reads[index]!;
+      try {
+        if (read.error !== undefined) throw read.error;
+        const file = read.file!;
+        sourceBytes = addGraphCorpusBytes(sourceBytes, Buffer.byteLength(file.source, "utf8"), "source");
+        const contentHash = sha256(file.source);
+        sourceSpool?.stage(entry.relPath, file.source);
+        files.push({ relPath: entry.relPath, contentHash, size: file.size, modifiedAt: file.modifiedAt });
+      } catch (error) {
+        if (isPerFileCorpusLimitError(error)) skipped.push(skippedSourceFile(entry.relPath, error));
+        else {
+          failures.push(sourceStagingFailure(entry.relPath, "read", error));
+          // The corpus limit stops discovery, as the sequential loop does.
+          if (error instanceof GraphCorpusLimitError) throw new GraphSourceStagingError(failures);
+        }
+      }
+    }
+  }
+  if (failures.length > 0) throw new GraphSourceStagingError(failures);
+  return { files, skipped };
+}
+
 function discoverSourceFiles(
   root: string,
   sourceFileAccess: GraphSourceFileAccess,
@@ -2193,6 +2359,63 @@ function readStableUtf8File(
   }
 }
 
+/**
+ * The JavaScript resolver `realpathSync` uses, asynchronously. The native one
+ * behind `fs/promises` expands Windows 8.3 short names (a runner's TEMP), so its
+ * answer would not compare equal to paths this engine resolved synchronously.
+ */
+function realpathAsync(path: string): Promise<string> {
+  return new Promise((resolveRealpath, reject) => {
+    realpath(path, (error, resolved) => (error ? reject(error) : resolveRealpath(resolved)));
+  });
+}
+
+/** {@link readStableUtf8File} through asynchronous calls, with the same checks in the same order. */
+async function readStableUtf8FileAsync(
+  canonicalPath: string,
+  sourcePath = canonicalPath,
+  maxBytes = GRAPH_CORPUS_LIMITS.maxSourceFileBytes,
+): Promise<{ source: string; size: number; modifiedAt: number }> {
+  const limitName = "maxSourceFileBytes";
+  const before = await lstatAsync(canonicalPath);
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw sourceContainmentError("Resolved source path is not a stable regular file.");
+  }
+  const remembered = recallSource(canonicalPath, before);
+  if (remembered !== undefined) {
+    if (!Number.isSafeInteger(before.size) || before.size < 0 || before.size > maxBytes) {
+      throw new GraphCorpusLimitError(limitName, Number.isSafeInteger(before.size) ? before.size : undefined);
+    }
+    return { source: remembered, size: before.size, modifiedAt: before.mtimeMs };
+  }
+  const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
+  const handle = await openAsync(canonicalPath, constants.O_RDONLY | noFollow);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameFileIdentity(before, opened)) {
+      throw sourceContainmentError("Source path changed before it could be opened.");
+    }
+    if (!Number.isSafeInteger(opened.size) || opened.size < 0 || opened.size > maxBytes) {
+      throw new GraphCorpusLimitError(limitName, Number.isSafeInteger(opened.size) ? opened.size : undefined);
+    }
+    const source = await handle.readFile("utf8");
+    const after = await handle.stat();
+    const resolvedAfter = await realpathAsync(sourcePath);
+    const pathAfter = await lstatAsync(resolvedAfter);
+    if (!sameFileIdentity(opened, after)
+      || !isSameResolvedPath(resolvedAfter, canonicalPath)
+      || !pathAfter.isFile()
+      || pathAfter.isSymbolicLink()
+      || !sameFileIdentity(opened, pathAfter)) {
+      throw sourceContainmentError("Source file changed while it was being read.");
+    }
+    rememberSource(canonicalPath, opened, source);
+    return { source, size: opened.size, modifiedAt: opened.mtimeMs };
+  } finally {
+    await handle.close();
+  }
+}
+
 function sameFileIdentity(
   left: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number },
   right: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number },
@@ -2333,14 +2556,14 @@ function validateCompilerInputs(
  * manifest verification so a checkout operation during either read is also
  * observed before the transaction begins.
  */
-function verifyPublicationInputs(
+async function verifyPublicationInputs(
   root: string,
   staged: StagedCorpus,
   gitBeforeStaging: GraphGitProvenance,
   sourceFileAccess: GraphSourceFileAccess,
   internal: GraphEngineInternalHooks = {},
-): GraphGitProvenance {
-  const currentFiles = discoverSourceFiles(root, sourceFileAccess).files;
+): Promise<GraphGitProvenance> {
+  const currentFiles = (await discoverSourceFilesConcurrently(root, sourceFileAccess)).files;
   const currentManifest = graphManifest(root);
   const failures: GraphSourceStagingFailure[] = [];
 

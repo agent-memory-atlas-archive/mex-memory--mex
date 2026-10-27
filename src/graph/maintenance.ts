@@ -623,7 +623,8 @@ async function rebuildGraphWithLease(
   try {
     assertNotAborted(options.signal);
     progress(options, "discover", "Inspecting graph recovery prerequisites.");
-    const priorStatus = await inspect(options, paths.projectRoot, paths.database);
+    const priorStatus = await timeGraphPhaseAsync("envelope.inspect", () =>
+      inspect(options, paths.projectRoot, paths.database));
     assertMaintenanceDirectoryUnchanged(paths);
     const databaseExists = existsSync(paths.database);
     if (databaseExists) assertClearSidecars(paths.database);
@@ -637,7 +638,7 @@ async function rebuildGraphWithLease(
     }
     let buildResult: BuildResult;
     try {
-      buildResult = await rebuildCandidate(paths, candidatePath, options);
+      buildResult = await timeGraphPhaseAsync("envelope.build", () => rebuildCandidate(paths, candidatePath!, options));
     } catch (error) {
       if (!cloneForContinuity || !isContinuityCloneCompatibilityFailure(error)) throw error;
       // An older database may be readable enough to identify its version yet
@@ -664,21 +665,21 @@ async function rebuildGraphWithLease(
     assertNotAborted(options.signal);
 
     progress(options, "validate", "Validating the isolated graph rebuild candidate.");
-    const candidate = await validateCandidate(options, paths, candidatePath);
+    const candidate = await timeGraphPhaseAsync("envelope.validate", () => validateCandidate(options, paths, candidatePath!));
     await options.__internal?.afterCandidateValidated?.(candidatePath, candidate.status);
     assertMaintenanceDirectoryUnchanged(paths);
 
     const retainRecovery = priorStatus.status === "corrupt"
       || priorStatus.status === "rebuild_required";
-    const publication = await publishCandidate({
+    const publication = await timeGraphPhaseAsync("envelope.publish", () => publishCandidate({
       paths,
-      candidatePath,
+      candidatePath: candidatePath!,
       candidate,
       priorStatus,
       priorIdentity,
       retainRecovery,
       options,
-    });
+    }));
     const published = continuityFallback
       ? {
           ...publication,
@@ -697,6 +698,7 @@ async function rebuildGraphWithLease(
     return maintenanceResult(started, finished, buildResult, published);
   } finally {
     if (candidatePath) cleanupOwnedDatabase(paths, candidatePath);
+    flushGraphPhaseTimings("rebuild", paths.projectRoot);
   }
 }
 
