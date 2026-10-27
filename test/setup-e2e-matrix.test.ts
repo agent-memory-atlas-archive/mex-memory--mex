@@ -21,6 +21,8 @@ import {
   type HeadlessSetupResult,
   type SetupProgressStep,
 } from "../src/setup/headless.js";
+import { SetupError } from "../src/setup/errors.js";
+import { SETUP_LOCK_FILE } from "../src/setup/setup-lock.js";
 import { loadPlanState } from "../src/setup/subsystem-state.js";
 import {
   KNOWLEDGE_FILES,
@@ -220,42 +222,32 @@ describe("setup end to end with a launched population agent (#292)", () => {
     RUN_TIMEOUT,
   );
 
-  // Until the shared-lock PR lands this still checks the final invariants.
-  // Once available, the second flow must fail with its exact setup refusal.
+  // One setup per checkout (#313): the second flow refuses with the exact
+  // message while the first holds the lock, and the first still finishes.
   it(
-    "two setups at once in one checkout leave one consistent finished setup",
+    "a second setup in a checkout that is already being set up refuses and the first finishes",
     async () => {
       const project = fixtureRepository();
-      const outcomes = await Promise.allSettled([
-        setup(project, "claude"),
-        setup(project, "claude"),
-      ]);
-      const succeeded = outcomes.filter(
-        (outcome) => outcome.status === "fulfilled",
+      const lock = join(project, ".mex", SETUP_LOCK_FILE);
+      const first = setup(project, "claude");
+      // Wait for the state the refusal depends on, not for a guessed delay.
+      await waitFor(() => existsSync(lock));
+      const refusal = await setup(project, "claude").then(
+        () => null,
+        (error: unknown) => error,
       );
-      if (existsSync(resolve("src/setup/setup-lock.ts"))) {
-        expect(succeeded).toHaveLength(1);
-        const refused = outcomes.find(
-          (outcome) => outcome.status === "rejected",
-        );
-        expect(
-          refused?.status === "rejected" ? String(refused.reason) : "",
-        ).toContain("Another MEX setup is already running");
-      }
-      expect(
-        succeeded.length,
-        JSON.stringify(
-          outcomes.map((outcome) =>
-            outcome.status === "rejected"
-              ? String(outcome.reason)
-              : outcome.value.stage,
-          ),
-        ),
-      ).toBeGreaterThan(0);
+      expect(refusal).toBeInstanceOf(SetupError);
+      expect((refusal as Error).message).toMatch(
+        /^Another MEX setup is already running in this checkout \(process (\d+), started \S+\)\. Wait for it to finish or stop it, then rerun setup\.$/u,
+      );
+      expect((refusal as Error).message).toContain(`process ${process.pid},`);
+      // The refused flow neither took over nor released the first one's lock.
+      expect(existsSync(lock)).toBe(true);
 
-      // Whatever raced, one more plain run settles on a finished setup.
-      const settled = await setup(project, "claude");
-      expect(settled).toMatchObject({ stage: "ready", ready: true });
+      const finished = await first;
+      expect(finished).toMatchObject({ stage: "ready", ready: true });
+      expect(agentStarts(project)).toBe(1);
+      expect(existsSync(lock)).toBe(false);
       assertFinishedScaffold(project);
     },
     RUN_TIMEOUT,

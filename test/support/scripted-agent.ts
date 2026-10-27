@@ -106,6 +106,20 @@ function walk(directory) {
   }
 }
 
+// A finished setup needs authored knowledge in all seven population files,
+// not only filled-in tokens (#304); the agent writes one real sentence each, last of all.
+const KNOWLEDGE = "Checkout is a small cart calculator that sums prices and adds 18 percent tax.";
+function author(file, anchor) {
+  const path = join(mexDir, file);
+  const text = readFileSync(path, "utf8");
+  if (text.includes(KNOWLEDGE)) return;
+  const heading = anchor ? new RegExp("^" + anchor + "[ \t]*\r?\n", "mu").exec(text) : null;
+  const next = heading
+    ? text.slice(0, heading.index + heading[0].length) + KNOWLEDGE + "\n" + text.slice(heading.index + heading[0].length)
+    : text.replace(/\s*$/u, "\n\n" + KNOWLEDGE + "\n");
+  writeFileSync(path, next, "utf8");
+}
+
 function main() {
   walk(mexDir);
   log("done:placeholders");
@@ -147,6 +161,10 @@ function main() {
     mex("wiki", "apply", file, "--apply");
   }
   log("done:fact");
+  // Written last: an agent stopped earlier leaves the files unauthored, so setup must run it again.
+  author("AGENTS.md", "## What This Is");
+  author("ROUTER.md", "## Current Project State");
+  for (const file of ["architecture", "stack", "conventions", "decisions", "setup"]) author("context/" + file + ".md");
   const receipt = /write exactly ([a-f0-9-]+) to (\.mex\/local\/setup-next\/[^ ]+\.done)/u.exec(prompt);
   if (receipt) writeFileSync(join(process.cwd(), receipt[2]), receipt[1]);
   return true;
