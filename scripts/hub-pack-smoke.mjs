@@ -1054,9 +1054,11 @@ async function verifyFreshCodeRepoSetup(tarball, workRoot, cache, version) {
   const normalized = output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
   for (const expected of [
     "Setup paused: scaffold population is still required.",
-    "Population prompt (paste it into your agent):",
+    "Population prompt:",
+    "You are the population agent. Run `mex setup next --start` in this session and do exactly what it prints.",
+    "Do not commit until setup reports complete.",
     "run `mex setup next --start` first, then do exactly what it prints.",
-    "Wiki migration and index are ready.",
+    "Wiki ids, links and index are ready.",
     "Graph and Wiki are ready. Review and commit the canonical MEX setup.",
   ]) {
     if (!normalized.includes(expected)) {
@@ -1152,7 +1154,13 @@ function populateSetupFixture(project) {
         const after = before
           .replaceAll("[Project Name]", "Setup Fixture")
           .replaceAll("[YYYY-MM-DD]", "2026-09-02");
-        if (after !== before) writeFileSync(path, after, "utf8");
+        if (after !== before || entry.name === "ROUTER.md") {
+          // Setup counts project knowledge, not text appended to MEX-managed boilerplate.
+          const note = "\nAuthored project guidance from source inspection.\n";
+          const slot = /^## (?:What This Is|Current (?:Project|Operational) State)[^\n]*\r?\n/mu.exec(after);
+          const at = slot ? slot.index + slot[0].length : after.length;
+          writeFileSync(path, after.slice(0, at) + note + after.slice(at), "utf8");
+        }
       }
     }
   };
@@ -1218,7 +1226,9 @@ function runManualPopulationSetup(cli, project, env, tools, {
   assertNoAgent();
   for (const expected of [
     "Setup paused: scaffold population is still required.",
-    "Population prompt (paste it into your agent):",
+    "Population prompt:",
+    "You are the population agent. Run `mex setup next --start` in this session and do exactly what it prints.",
+    "Do not commit until setup reports complete.",
     "run `mex setup next --start` first, then do exactly what it prints.",
   ]) {
     if (!paused.includes(expected)) {
@@ -1231,7 +1241,7 @@ function runManualPopulationSetup(cli, project, env, tools, {
   const completed = runPlainSetup(cli, project, env, entryOptions, 0);
   assertNoAgent();
   for (const expected of [
-    "Wiki migration and index are ready.",
+    "Wiki ids, links and index are ready.",
     "Graph and Wiki are ready. Review and commit the canonical MEX setup.",
     "Run `mex setup --browser` to open the setup completion page.",
   ]) {
@@ -1318,9 +1328,11 @@ function verifyPackedSetupOutput(output) {
     "Link AI tool instructions",
     "Install official MEX agent skills",
     "Setup paused: scaffold population is still required.",
-    "Population prompt (paste it into your agent):",
+    "Population prompt:",
+    "You are the population agent. Run `mex setup next --start` in this session and do exactly what it prints.",
+    "Do not commit until setup reports complete.",
     "run `mex setup next --start` first, then do exactly what it prints.",
-    "Wiki migration and index are ready.",
+    "Wiki ids, links and index are ready.",
     "Graph and Wiki are ready. Review and commit the canonical MEX setup.",
   ];
   // Installation itself is checked against the exact packaged trees, managed
