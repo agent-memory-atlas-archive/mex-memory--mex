@@ -98,6 +98,8 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+const RANK_THREE_ANSWER = "function:third-answer";
+
 describe("semantic query source reservation", () => {
   const node = (id: string, name: string, filePath: string, signature?: string): GraphNode => ({
     id, kind: "function", name, qualifiedName: name, signature,
@@ -880,7 +882,9 @@ describe("runGraphScope", () => {
         "How does Framework assemble pipeline stages with handlers?",
         isolated,
         cohesiveDeps,
-        { maxOutputTokens: 1200, maxSourceLines: 200, maxFiles: 3 },
+        // Below the whole cohesive file, now that the summary reserve is no
+        // larger than the summary (#305); at 1200 the file fits.
+        { maxOutputTokens: 900, maxSourceLines: 200, maxFiles: 3 },
       ));
       expect(constrained.at(-1)).toMatchObject({
         type: "summary", status: "partial", truncated: true,
@@ -891,7 +895,7 @@ describe("runGraphScope", () => {
     }
   });
 
-  it("admits a rank-three file's compact primary before an earlier file's optional bodies", () => {
+  function runRankThreeFixture(maxOutputTokens: number): Record<string, unknown>[] {
     const isolated = mkdtempSync(join(tmpdir(), "mex-source-fairness-"));
     const dense = "x".repeat(120);
     const firstLines = Array.from({ length: 240 }, (_, index) => `// first filler ${index + 1}`);
@@ -1006,28 +1010,57 @@ describe("runGraphScope", () => {
         "locate the pipeline declaration answer",
         isolated,
         fairnessDeps,
-        { maxOutputTokens: 3500, maxSourceLines: 200, maxFiles: 3 },
+        { maxOutputTokens, maxSourceLines: 200, maxFiles: 3 },
       ));
-      const sourceRecords = records.filter((record) => record.type === "source");
-      const targetIndex = sourceRecords.findIndex((record) => (record.ranges as Array<{ nodeIds: string[] }>)
-        .some((range) => range.nodeIds.includes(target.id)));
-      const optionalIndex = sourceRecords.findIndex((record) => record.filePath === "first.ts"
-        && (record.ranges as Array<{ startLine: number }>).some((range) => range.startLine > 25));
-      expect(targetIndex, JSON.stringify(records)).toBeGreaterThanOrEqual(0);
-      expect(optionalIndex === -1 || optionalIndex > targetIndex).toBe(true);
-      expect(sourceRecords[targetIndex]).toMatchObject({
-        filePath: "third.ts",
-        ranges: [expect.objectContaining({ startLine: 170, endLine: 175, truncated: false })],
-      });
-      expect(records.at(-1)).toMatchObject({
-        type: "summary",
-        returnedFiles: expect.arrayContaining(["first.ts", "second.ts", "third.ts"]),
-        maxOutputTokens: 3500,
-      });
-      expect(records.at(-1)!.estimatedOutputTokens as number).toBeLessThanOrEqual(3500);
+      return records;
     } finally {
       rmSync(isolated, { recursive: true, force: true });
     }
+  }
+
+  it("admits a rank-three file's compact primary before an earlier file's optional bodies", () => {
+    const records = runRankThreeFixture(3500);
+    const target = { id: RANK_THREE_ANSWER };
+    const sourceRecords = records.filter((record) => record.type === "source");
+    const targetIndex = sourceRecords.findIndex((record) => (record.ranges as Array<{ nodeIds: string[] }>)
+      .some((range) => range.nodeIds.includes(target.id)));
+    const optionalIndex = sourceRecords.findIndex((record) => record.filePath === "first.ts"
+      && (record.ranges as Array<{ startLine: number }>).some((range) => range.startLine > 25));
+    expect(targetIndex, JSON.stringify(records)).toBeGreaterThanOrEqual(0);
+    expect(optionalIndex === -1 || optionalIndex > targetIndex).toBe(true);
+    expect(sourceRecords[targetIndex]).toMatchObject({
+      filePath: "third.ts",
+      ranges: [expect.objectContaining({ startLine: 170, endLine: 175, truncated: false })],
+    });
+    expect(records.at(-1)).toMatchObject({
+      type: "summary",
+      returnedFiles: expect.arrayContaining(["first.ts", "second.ts", "third.ts"]),
+      maxOutputTokens: 3500,
+    });
+    expect(records.at(-1)!.estimatedOutputTokens as number).toBeLessThanOrEqual(3500);
+  });
+
+  // More budget never returns less of the answer (#305): once the rank-three
+  // compact answer fits, it is returned at every larger budget, and a budget
+  // that omits it says so.
+  it("returns the rank-three compact answer at every budget from the first that fits", () => {
+    let firstFit: number | null = null;
+    const misses: number[] = [];
+    for (let budget = 3000; budget <= 6000; budget += 25) {
+      const records = runRankThreeFixture(budget);
+      const summary = records.at(-1)!;
+      expect(summary.estimatedOutputTokens as number, `budget ${budget}`).toBeLessThanOrEqual(budget);
+      const answered = records.some((record) => record.type === "source" && record.filePath === "third.ts"
+        && (record.ranges as Array<{ startLine: number; endLine: number; truncated: boolean }>)
+          .some((range) => range.startLine === 170 && range.endLine === 175 && !range.truncated));
+      if (answered) firstFit ??= budget;
+      else {
+        if (firstFit !== null) misses.push(budget);
+        expect(summary.status, `budget ${budget}`).toBe("partial");
+      }
+    }
+    expect(firstFit).not.toBeNull();
+    expect(misses).toEqual([]);
   });
 
   it("completes a later file's first bounded direct answer after an oversized decoy", () => {
@@ -2128,13 +2161,13 @@ describe("runGraphScope --fingerprint", () => {
   );
 
   it.each(["minimal", "standard"] as const)(
-    "keeps fingerprints at %s detail when flows alone would fill the budget",
+    "prioritizes fingerprint facts ahead of flows at %s detail",
     (detail) => {
       const off = capture(() => runGraphScope(task, fpRoot, fpDeps, { detail, maxOutputTokens: 1500 }));
-      expect(off.filter((record) => record.type === "fact")).toHaveLength(0);
       const on = capture(() => runGraphScope(task, fpRoot, fpDeps, { detail, maxOutputTokens: 1500, fingerprint: true }));
       const facts = on.filter((record) => record.type === "fact");
       expect(facts.length).toBeGreaterThan(0);
+      expect(facts.length).toBeGreaterThanOrEqual(off.filter(record => record.type === "fact").length);
       for (const fact of facts) expect(fact.fingerprint).toEqual(expect.any(String));
       // Flows keep their bounded share.
       expect(on.some((record) => record.type === "flow")).toBe(true);
@@ -2158,12 +2191,12 @@ describe("runGraphScope --fingerprint", () => {
   it.each(["minimal", "standard"] as const)(
     "reports partial with a warning, not no-match, when no fingerprint fits at %s detail",
     (detail) => {
-      const records = capture(() => runGraphScope(task, fpRoot, fpDeps, { detail, maxOutputTokens: 800, fingerprint: true }));
+      const records = capture(() => runGraphScope(task, fpRoot, fpDeps, { detail, maxOutputTokens: 500, fingerprint: true }));
       const summary = records.at(-1)!;
       expect(summary.status).toBe("partial");
       expect(summary.warnings).toContainEqual(expect.stringMatching(/^Fingerprints omitted: \d+ fact\(s\)/));
-      expect(summary.estimatedOutputTokens as number).toBeLessThanOrEqual(800);
-      const off = capture(() => runGraphScope(task, fpRoot, fpDeps, { detail, maxOutputTokens: 800 }));
+      expect(summary.estimatedOutputTokens as number).toBeLessThanOrEqual(500);
+      const off = capture(() => runGraphScope(task, fpRoot, fpDeps, { detail, maxOutputTokens: 500 }));
       expect(off.at(-1)!.warnings).not.toContainEqual(expect.stringMatching(/^Fingerprints omitted/));
     },
   );
