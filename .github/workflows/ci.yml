@@ -122,6 +122,10 @@ jobs:
           src/graph/__tests__/fingerprint-store-transactions.test.ts
           src/graph/__tests__/store-statements.test.ts
           src/graph/__tests__/engine-continuity-resources.test.ts
+          src/statechart/__tests__/contract.test.ts
+          src/statechart/__tests__/repository.test.ts
+          src/statechart/__tests__/checker.test.ts
+          test/hub-diagrams-integration.test.ts
       - name: Run platform-sensitive setup end-to-end tests
         # The full interruption matrix runs on Linux in `npm run test`; here only the
         # cases that touch process launching, line endings and killing a process tree.
